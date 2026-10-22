@@ -65,10 +65,96 @@ fn guard<T>(f: impl FnOnce() -> AResult<T>) -> AResult<T> {
 }
 
 fn read_archive(path: &str) -> AResult<(Vec<u8>, Format)> {
-    let bytes =
-        std::fs::read(path).map_err(|e| (ERR_NOT_FOUND, format!("cannot read '{path}': {e}")))?;
+    use std::io::Read;
+    let file = std::fs::File::open(path)
+        .map_err(|e| (ERR_NOT_FOUND, format!("cannot read '{path}': {e}")))?;
+    let mut bytes = Vec::new();
+    file.take(crate::MAX_ARCHIVE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| (ERR_PLATFORM, e.to_string()))?;
+    if bytes.len() > crate::MAX_ARCHIVE_BYTES {
+        return crate::err(ERR_CORRUPT, "archive exceeds 256 MiB input limit");
+    }
     let fmt = detect_format(&bytes, path)?;
+    let metas = list_entries(&bytes, fmt)?;
+    let mut total = 0u64;
+    for m in &metas {
+        total = total
+            .checked_add(m.size)
+            .ok_or((ERR_CORRUPT, "archive size overflow".into()))?;
+        if m.size > crate::MAX_ENTRY_BYTES as u64 || total > crate::MAX_TOTAL_BYTES {
+            return crate::err(ERR_CORRUPT, "archive exceeds output budget");
+        }
+    }
     Ok((bytes, fmt))
+}
+
+fn safe_directories(path: &Path) -> AResult<()> {
+    let absolute = std::path::absolute(path).map_err(|e| (ERR_PLATFORM, e.to_string()))?;
+    if absolute
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return crate::err(
+            ERR_INVALID_ARG,
+            "destination must not contain parent components",
+        );
+    }
+    let chain: Vec<_> = absolute.ancestors().collect();
+    for item in chain.into_iter().rev() {
+        if !item.exists() {
+            std::fs::create_dir(item).map_err(|e| {
+                (
+                    ERR_PLATFORM,
+                    format!("cannot create {}: {e}", item.display()),
+                )
+            })?;
+        }
+        let meta = std::fs::symlink_metadata(item).map_err(|e| (ERR_PLATFORM, e.to_string()))?;
+        #[cfg(windows)]
+        let reparse = {
+            use std::os::windows::fs::MetadataExt;
+            meta.file_attributes() & 0x400 != 0
+        };
+        #[cfg(not(windows))]
+        let reparse = meta.file_type().is_symlink();
+        if reparse || !meta.is_dir() {
+            return crate::err(
+                ERR_CORRUPT,
+                format!(
+                    "destination ancestor is not a plain directory: {}",
+                    item.display()
+                ),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn write_extracted(target: &Path, data: &[u8]) -> AResult<()> {
+    use std::io::Write;
+    if let Some(parent) = target.parent() {
+        safe_directories(parent)?;
+    }
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
+        .map_err(|e| {
+            (
+                ERR_PLATFORM,
+                format!(
+                    "cannot create new file {} (existing files are never overwritten): {e}",
+                    target.display()
+                ),
+            )
+        })?;
+    output.write_all(data).map_err(|e| {
+        (
+            ERR_PLATFORM,
+            format!("incomplete file retained at {}: {e}", target.display()),
+        )
+    })
 }
 
 fn list_entries(bytes: &[u8], fmt: Format) -> AResult<Vec<EntryMeta>> {
@@ -134,29 +220,11 @@ fn extract_all(bytes: &[u8], fmt: Format, dest: &Path) -> AResult<u64> {
             format!("entry '{}' would escape the destination; refused", m.name),
         ))?;
         if m.is_dir {
-            std::fs::create_dir_all(&target).map_err(|e| {
-                (
-                    ERR_PLATFORM,
-                    format!("cannot create directory {}: {e}", target.display()),
-                )
-            })?;
+            safe_directories(&target)?;
             continue;
         }
         if let Some(data) = read_one(bytes, fmt, &m.name)? {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    (
-                        ERR_PLATFORM,
-                        format!("cannot create directory {}: {e}", parent.display()),
-                    )
-                })?;
-            }
-            std::fs::write(&target, &data).map_err(|e| {
-                (
-                    ERR_PLATFORM,
-                    format!("cannot write {}: {e}", target.display()),
-                )
-            })?;
+            write_extracted(&target, &data)?;
             count += 1;
         }
     }
@@ -294,20 +362,7 @@ pub extern "C" fn ak_extract(
                 ),
             ))?;
             let data = read_one(&bytes, fmt, &meta.name)?.unwrap_or_default();
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    (
-                        ERR_PLATFORM,
-                        format!("cannot create directory {}: {e}", parent.display()),
-                    )
-                })?;
-            }
-            std::fs::write(&target, &data).map_err(|e| {
-                (
-                    ERR_PLATFORM,
-                    format!("cannot write {}: {e}", target.display()),
-                )
-            })?;
+            write_extracted(&target, &data)?;
             Ok(1)
         }
     });

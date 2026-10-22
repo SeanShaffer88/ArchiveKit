@@ -8,7 +8,7 @@
 //!   ZIP64, no multi-disk archives — archives needing them fail with
 //!   ERR_NOT_SUPPORTED and a specific message, never a silent misread.
 //! - TAR: read + write (ustar). Regular files and directories.
-//! - Extraction is traversal-safe by construction: entries that would
+//! - Extraction rejects unsafe lexical names and detected link ancestors; entries that would
 //!   land outside the destination are refused (see [`safe_join`]).
 
 pub mod crc32;
@@ -23,6 +23,11 @@ pub const VERSION: &str = "0.1.0";
 pub const VERSION_MAJOR: u32 = 0;
 pub const VERSION_MINOR: u32 = 1;
 pub const VERSION_PATCH: u32 = 0;
+
+pub const MAX_ARCHIVE_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_ENTRY_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_ENTRIES: usize = 10_000;
 
 pub const AK_OK: i32 = 0;
 pub const ERR_INVALID_ARG: i32 = 1;
@@ -179,6 +184,17 @@ pub fn safe_join(dest: &std::path::Path, entry_name: &str) -> Option<std::path::
             "" | "." => continue,
             ".." => return None,
             c => {
+                if c.contains(':') || c.ends_with([' ', '.']) || c.chars().any(char::is_control) {
+                    return None;
+                }
+                let stem = c.split('.').next().unwrap_or("").to_ascii_uppercase();
+                if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+                    || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+                        && stem.len() == 4
+                        && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+                {
+                    return None;
+                }
                 out.push(c);
                 parts += 1;
             }

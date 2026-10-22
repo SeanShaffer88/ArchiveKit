@@ -77,6 +77,9 @@ pub fn list(bytes: &[u8]) -> AResult<Vec<TarEntry>> {
         let mtime = parse_octal(&block[136..148])? as i64;
         let typeflag = block[156];
         let is_dir = typeflag == b'5' || full.ends_with('/');
+        if size > crate::MAX_ENTRY_BYTES as u64 || entries.len() >= crate::MAX_ENTRIES {
+            return err(ERR_CORRUPT, "TAR entry exceeds resource limits");
+        }
         entries.push(TarEntry {
             meta: EntryMeta {
                 name: full,
@@ -91,7 +94,13 @@ pub fn list(bytes: &[u8]) -> AResult<Vec<TarEntry>> {
             typeflag,
         });
         let blocks = (size as usize).div_ceil(512);
-        off += 512 + blocks * 512;
+        off = off
+            .checked_add(512)
+            .and_then(|n| blocks.checked_mul(512).and_then(|b| n.checked_add(b)))
+            .ok_or((ERR_CORRUPT, "TAR length overflow".into()))?;
+        if off > bytes.len() {
+            return err(ERR_CORRUPT, "TAR entry data overruns archive");
+        }
     }
     Ok(entries)
 }
@@ -107,7 +116,13 @@ pub fn read_entry(bytes: &[u8], entry: &TarEntry) -> AResult<Vec<u8>> {
             )
         }
     }
-    let end = entry.data_offset + entry.meta.size as usize;
+    if entry.meta.size > crate::MAX_ENTRY_BYTES as u64 {
+        return err(ERR_CORRUPT, "TAR entry exceeds output limit");
+    }
+    let end = entry
+        .data_offset
+        .checked_add(entry.meta.size as usize)
+        .ok_or((ERR_CORRUPT, "TAR length overflow".into()))?;
     if end > bytes.len() {
         return err(ERR_CORRUPT, "tar entry data overruns archive");
     }

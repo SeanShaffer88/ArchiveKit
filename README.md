@@ -55,3 +55,7 @@ cargo test
 ## License
 
 MIT.
+
+## Input review and reporting
+
+Read the [bounded input and safety contract](docs/INPUT_REVIEW.md), including intentional refusals and remaining validation gaps. Report sensitive issues through the [security policy](SECURITY.md).

@@ -71,6 +71,9 @@ pub fn list(bytes: &[u8]) -> AResult<Vec<ZipEntry>> {
             "multi-disk ZIP archives are not supported",
         );
     }
+    if total > crate::MAX_ENTRIES {
+        return err(ERR_CORRUPT, "ZIP entry count exceeds limit");
+    }
     let mut entries = Vec::with_capacity(total);
     let mut off = cd_offset;
     for _ in 0..total {
@@ -124,6 +127,9 @@ pub fn list(bytes: &[u8]) -> AResult<Vec<ZipEntry>> {
 
 /// Decompress + verify one entry's data.
 pub fn read_entry(bytes: &[u8], entry: &ZipEntry) -> AResult<Vec<u8>> {
+    if entry.meta.size > crate::MAX_ENTRY_BYTES as u64 {
+        return err(ERR_CORRUPT, "ZIP entry exceeds output limit");
+    }
     let off = entry.local_offset as usize;
     if u32le(bytes, off)? != SIG_LOCAL {
         return err(ERR_CORRUPT, "bad local header signature");
@@ -138,7 +144,8 @@ pub fn read_entry(bytes: &[u8], entry: &ZipEntry) -> AResult<Vec<u8>> {
     let raw = &bytes[data_start..data_start + comp_size];
     let data = match entry.method_id {
         0 => raw.to_vec(),
-        8 => crate::inflate::inflate(raw).map_err(|e| (ERR_CORRUPT, e))?,
+        8 => crate::inflate::inflate_limited(raw, entry.meta.size as usize)
+            .map_err(|e| (ERR_CORRUPT, e))?,
         m => {
             return err(
                 ERR_NOT_SUPPORTED,

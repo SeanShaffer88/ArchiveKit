@@ -124,11 +124,17 @@ fn inflate_block(
     out: &mut Vec<u8>,
     lit: &Huffman,
     dist: &Huffman,
+    limit: usize,
 ) -> IResult<bool> {
     loop {
         let sym = lit.decode(br)?;
         match sym {
-            0..=255 => out.push(sym as u8),
+            0..=255 => {
+                if out.len() >= limit {
+                    return Err("decompressed size exceeds the limit".into());
+                }
+                out.push(sym as u8);
+            }
             256 => return Ok(true),
             257..=285 => {
                 let idx = (sym - 257) as usize;
@@ -145,6 +151,9 @@ fn inflate_block(
                 if d > out.len() {
                     return Err("deflate distance too far back".into());
                 }
+                if len > limit.saturating_sub(out.len()) {
+                    return Err("decompressed size exceeds the limit".into());
+                }
                 let start = out.len() - d;
                 for i in 0..len {
                     let b = out[start + i];
@@ -160,6 +169,11 @@ fn inflate_block(
 /// final block's end byte (callers that know the exact length — ZIP —
 /// pass exactly the compressed bytes).
 pub fn inflate(data: &[u8]) -> IResult<Vec<u8>> {
+    inflate_limited(data, crate::MAX_ENTRY_BYTES)
+}
+
+/// Reject expansion before allocating beyond the caller's budget.
+pub fn inflate_limited(data: &[u8], limit: usize) -> IResult<Vec<u8>> {
     let mut br = BitReader::new(data);
     let mut out = Vec::new();
     loop {
@@ -182,6 +196,9 @@ pub fn inflate(data: &[u8]) -> IResult<Vec<u8>> {
                 if br.pos + len > data.len() {
                     return Err("stored block overruns input".into());
                 }
+                if len > limit.saturating_sub(out.len()) {
+                    return Err("decompressed size exceeds the limit".into());
+                }
                 out.extend_from_slice(&data[br.pos..br.pos + len]);
                 br.pos += len;
             }
@@ -197,7 +214,7 @@ pub fn inflate(data: &[u8]) -> IResult<Vec<u8>> {
                 }
                 let lit = Huffman::from_lengths(&lit_lengths)?;
                 let dist = Huffman::from_lengths(&[5u8; 30])?;
-                inflate_block(&mut br, &mut out, &lit, &dist)?;
+                inflate_block(&mut br, &mut out, &lit, &dist, limit)?;
             }
             2 => {
                 let hlit = br.bits(5)? as usize + 257;
@@ -254,7 +271,7 @@ pub fn inflate(data: &[u8]) -> IResult<Vec<u8>> {
                 }
                 let lit = Huffman::from_lengths(&lengths[..hlit])?;
                 let dist = Huffman::from_lengths(&lengths[hlit..])?;
-                inflate_block(&mut br, &mut out, &lit, &dist)?;
+                inflate_block(&mut br, &mut out, &lit, &dist, limit)?;
             }
             _ => return Err("reserved deflate block type".into()),
         }

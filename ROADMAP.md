@@ -53,6 +53,9 @@ extraction.
   gzip/bzip2/xz/zstd/7z/RAR input is named as such instead of "unknown format".
 - GNU sparse members report `type: sparse` and are skipped with a warning
   rather than extracted as stubs of the wrong contents.
+- `ak_zip_append` keeps the archive comment, records the appended file's
+  read-only bit, and refuses traversal names and duplicates instead of building
+  archives this library would then reject.
 - Per-entry budget errors name the entry and its size instead of saying only
   that the archive exceeded a budget.
 

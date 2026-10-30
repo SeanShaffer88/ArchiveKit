@@ -22,20 +22,6 @@ back to the extension. Listing JSON per entry:
 DOS read-only attribute (ZIP) or a mode with no write bit (TAR); `type` is
 `file`, `dir`, `symlink`, `hardlink`, `sparse` or `other`.
 
-## Timestamps
-
-`modified_unix` is the modification time the archive states, in Unix seconds.
-For ZIP that means the exact value when the archive carries an extended
-timestamp (`0x5455` or NTFS `0x000A`), falling back to the DOS field, whose
-resolution is 2 seconds and whose range is 1980-2107; a zero DOS time is
-reported as the DOS epoch because that is what the archive says. For TAR it is
-the header's `mtime`, with pax overrides honoured, and `null` when the archive
-records none.
-
-Extraction restores those times best-effort. A TAR entry with no recorded time
-is left alone; a failed attribute write never fails the extraction, since the
-content is already on disk.
-
 ## What gets extracted
 
 Regular files and directories are written. TAR entries of any other kind —
@@ -91,10 +77,26 @@ preserved and are not applied.
 
 ## Timestamps
 
-| archive | resolution | restored |
+| archive | reported | restored |
 |---|---|---|
-| ZIP | 2 s, 1980-2107 | yes (zero clamps to 1980) |
-| TAR | 1 s | yes (zero = unknown, left alone) |
+| ZIP | exact when `0x5455`/`0x000A` is present, else DOS (2 s, 1980-2107) | yes (zero clamps to 1980) |
+| TAR | header `mtime`, pax override honoured, `null` if absent | yes (zero = unknown, left alone) |
+
+The DOS field's rounding and range are why the extra fields are read at all:
+ignoring them reported `...:02` for a `...:01` file and 1980 for anything
+older. Restoration is best-effort - a TAR entry with no recorded time is left
+alone, and a failed attribute write never fails the extraction, because the
+content is already on disk.
+
+## Appending
+
+`ak_zip_append(archive, file, arcname)` adds one file to an existing ZIP,
+rewriting the archive. The archive's comment is preserved, entries keep their
+content, timestamps and read-only flag, and the new file's own mtime and
+read-only bit are recorded. `arcname` must be a safe relative path: an
+absolute path, a drive letter, any `..` component or an empty name is
+`AK_ERR_INVALID_ARG`, and so is a name the archive already holds (appending
+never overwrites). TAR archives are not appendable in v0.2.
 
 ## Extracting a folder
 
@@ -146,16 +148,18 @@ non-UTF-8 arguments). Details via `ak_last_error()` (thread-local).
 - DEFLATE compression is LZ77 + dynamic Huffman in 1 MiB blocks. That is
   within ~0-2% of zlib level 6 on the samples measured here, but it is not
   an optimal parser: expect a few percent behind `-9` on some inputs.
-- `ak_zip_append` rewrites the archive (entries re-encoded); content is
-  preserved, byte layout is not.
+- `ak_zip_append` rewrites the archive (entries re-encoded); content,
+  timestamps, read-only flags and the archive comment are preserved, byte
+  layout is not. Duplicate and unsafe names are refused rather than written.
 - TAR *writing* is ustar, with one exception: a name that cannot be
   expressed as a 155+100 byte prefix split is written as a GNU `L` record,
   which GNU tar, bsdtar, 7-Zip and Python's tarfile read (strict ustar-only
   readers will see the truncated name). Reading handles GNU `L` and pax `x`
   records. Long-name records are capped at 64 KiB, matching the reader.
 - Attributes: only the read-only bit round-trips (see above).
-- Timestamps: ZIP stores DOS time (2-second resolution, 1980-2107); TAR
-  stores whole seconds. Extraction restores the archive's modified time on
+- Timestamps: ZIP stores DOS time (2-second resolution, 1980-2107), so a
+  writer that needs better puts it in an extra field and this reader prefers
+  that when present; TAR stores whole seconds. Extraction restores the archive's modified time on
   files and on listed directories (directories last, so writing children
   cannot undo them). ZIP cannot express a time before 1980, so a zero ZIP
   timestamp restores as 1980-01-01; a zero *TAR* timestamp is treated as

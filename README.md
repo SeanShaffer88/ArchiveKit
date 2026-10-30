@@ -43,6 +43,10 @@ ak_zip_append("backup.zip", "extra.log", "logs/extra.log");
   re-applied on extract. Both use the same ordering rule, directories last,
   so writing children cannot undo a parent's time and a read-only directory
   can still be populated before it is locked.
+- **Appending never loses the archive's own note.** `ak_zip_append` keeps the
+  ZIP archive comment, and refuses a name that is absolute, contains `..`, or
+  already exists — appending is not a way to build an archive this library
+  would then refuse to extract.
 - **Old and wrapped archives get an answer, not a shrug.** TAR reads v7 (the
   pre-ustar format, recognised by its header checksum) as well as ustar, GNU
   and pax. A `.tar.gz`, `.tar.bz2`, `.xz`, `.zst`, 7z or RAR file is named as
@@ -88,7 +92,7 @@ ak_zip_append("backup.zip", "extra.log", "logs/extra.log");
 
 ## Verification status
 
-- 55 tests: 50 unit tests plus 5 integration tests. CRC vectors;
+- 57 tests: 52 unit tests plus 5 integration tests. CRC vectors;
   zlib-produced DEFLATE streams (embedded, byte-exact); deflate↔inflate
   roundtrips including incompressible data, window-edge data, block
   boundaries and multi-block streams; Huffman length limiting and

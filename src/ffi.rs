@@ -872,6 +872,14 @@ pub extern "C" fn ak_zip_append(
                 "append is supported for ZIP archives only",
             );
         }
+        // An appended name becomes a path in every other tool that reads the
+        // archive, so it gets the same treatment an extracted name does: no
+        // traversal, no absolute path, no drive letter, and no empty name.
+        let appended = crate::safe_join(Path::new("."), &arcname).ok_or((
+            ERR_INVALID_ARG,
+            format!("arcname '{arcname}' is not a safe relative path inside the archive"),
+        ))?;
+        let appended_key = collision_key(&appended);
         let mut entries: Vec<NewEntry> = Vec::new();
         for index in 0..listed.len() {
             let meta = listed.meta_at(index);
@@ -884,19 +892,40 @@ pub extern "C" fn ak_zip_append(
                 let data = listed.read(&bytes, index)?;
                 NewEntry::file(meta.name.clone(), data, meta.modified_unix.unwrap_or(0))
             };
+            // Two entries with one name is an archive this library refuses to
+            // extract, so appending must not be a way to build one.
+            let name = if meta.is_dir {
+                meta.name.trim_end_matches('/').to_string()
+            } else {
+                meta.name.clone()
+            };
+            if let Some(existing) = crate::safe_join(Path::new("."), &name) {
+                if collision_key(&existing) == appended_key {
+                    return crate::err(
+                        ERR_INVALID_ARG,
+                        format!("archive already has an entry named '{arcname}'"),
+                    );
+                }
+            }
             entry.read_only = meta.read_only;
             entries.push(entry);
         }
         let data = std::fs::read(&file)
             .map_err(|e| (ERR_NOT_FOUND, format!("cannot read '{file}': {e}")))?;
-        let mtime = std::fs::metadata(&file)
-            .and_then(|m| m.modified())
+        let metadata = std::fs::metadata(&file)
+            .map_err(|e| (ERR_NOT_FOUND, format!("cannot stat '{file}': {e}")))?;
+        let mtime = metadata
+            .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        entries.push(NewEntry::file(arcname, data, mtime));
-        let bytes = zip::create(&entries)?;
+        let mut new_entry = NewEntry::file(arcname, data, mtime);
+        new_entry.read_only = metadata.permissions().readonly();
+        entries.push(new_entry);
+        // Whatever the archive said about itself survives the rewrite.
+        let comment = zip::read_comment(&bytes)?;
+        let bytes = zip::create_with_comment(&entries, &comment)?;
         std::fs::write(&archive, bytes)
             .map_err(|e| (ERR_PLATFORM, format!("cannot write '{archive}': {e}")))?;
         Ok(())
@@ -1726,6 +1755,74 @@ mod tests {
             -1
         );
         assert_eq!(ak_last_error_code(), crate::ERR_NOT_SUPPORTED as c_int);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn append_keeps_the_comment_and_refuses_hostile_or_duplicate_names() {
+        let base = std::env::temp_dir().join(format!("ak-append-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let archive = base.join("a.zip");
+        fs::write(
+            &archive,
+            zip::create_with_comment(
+                &[NewEntry::file(
+                    "first.txt",
+                    b"first".to_vec(),
+                    1_792_674_000,
+                )],
+                b"created elsewhere",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let archive_c = cstr(archive.to_str().unwrap());
+        let payload = base.join("payload.txt");
+        fs::write(&payload, b"payload").unwrap();
+        let payload_c = cstr(payload.to_str().unwrap());
+
+        // The archive's own note has nothing to do with its entries, so an
+        // append must not destroy it.
+        assert_eq!(
+            ak_zip_append(
+                archive_c.as_ptr(),
+                payload_c.as_ptr(),
+                cstr("second.txt").as_ptr()
+            ),
+            0
+        );
+        let bytes = fs::read(&archive).unwrap();
+        assert_eq!(zip::read_comment(&bytes).unwrap(), b"created elsewhere");
+        let listed = zip::list(&bytes).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[1].meta.name, "second.txt");
+
+        // Names that would become an escape in some other tool are refused
+        // here, and so are duplicates: appending must not be a way to build an
+        // archive this library then refuses to extract.
+        for bad in ["../escape.txt", "/abs.txt", "C:\\evil.txt", ""] {
+            assert_eq!(
+                ak_zip_append(archive_c.as_ptr(), payload_c.as_ptr(), cstr(bad).as_ptr()),
+                crate::ERR_INVALID_ARG
+            );
+        }
+        assert_eq!(
+            ak_zip_append(
+                archive_c.as_ptr(),
+                payload_c.as_ptr(),
+                cstr("first.txt").as_ptr()
+            ),
+            crate::ERR_INVALID_ARG
+        );
+        // SAFETY: thread-local C string owned by this module.
+        let message = unsafe { CStr::from_ptr(ak_last_error()) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(message.contains("first.txt"), "{message}");
+        // Nothing was written by the refused attempts.
+        assert_eq!(zip::list(&fs::read(&archive).unwrap()).unwrap().len(), 2);
         let _ = fs::remove_dir_all(&base);
     }
 

@@ -37,6 +37,15 @@ mis-parsed as corrupt or partially listed. ZIP64 *extra fields* whose central
 directory still carries classic sizes (what streaming writers emit) remain
 readable, because sizes are taken from the central directory.
 
+**Appending is held to the same rules as extracting.** `ak_zip_append`
+rebuilds the archive, so it is also the one place where an archive could be
+*build* with a name this library would refuse to extract. Names are therefore
+checked with `safe_join`, duplicates are refused (case-insensitively on
+Windows, where the filesystem would merge them), and an existing archive
+comment is carried over instead of being silently dropped. Because the rebuild
+reads every entry, an archive holding a method this library cannot decode
+(e.g. bzip2) cannot be appended to: it fails before anything is written.
+
 **TAR variants and non-archives.** v7 headers (no `ustar` magic) are accepted
 when the header checksum validates, which is the only evidence that format
 offers; a 512-byte block of zeros with a bogus checksum is still not a tar.

@@ -455,6 +455,24 @@ impl NewEntry {
 /// 65,535 entries, a member or offset at or above 4 GiB — is refused with
 /// ERR_NOT_SUPPORTED rather than written with wrapped counts.
 pub fn create(entries: &[NewEntry]) -> AResult<Vec<u8>> {
+    create_with_comment(entries, b"")
+}
+
+/// The archive comment the last EOCD records, empty when there is none. An
+/// archive often carries a note ("built by X, 2026-10-30") and rewriting it
+/// without one silently destroys data that has nothing to do with the entries.
+pub fn read_comment(bytes: &[u8]) -> AResult<Vec<u8>> {
+    let eocd = find_eocd(bytes)?;
+    let len = u16le(bytes, eocd + 20)? as usize;
+    let start = eocd + 22;
+    if start + len > bytes.len() {
+        return err(ERR_CORRUPT, "ZIP comment overruns archive");
+    }
+    Ok(bytes[start..start + len].to_vec())
+}
+
+/// `create`, keeping a caller-supplied archive comment.
+pub fn create_with_comment(entries: &[NewEntry], comment: &[u8]) -> AResult<Vec<u8>> {
     if entries.len() > u16::MAX as usize {
         return err(
             ERR_NOT_SUPPORTED,
@@ -548,7 +566,11 @@ pub fn create(entries: &[NewEntry]) -> AResult<Vec<u8>> {
     out.extend_from_slice(&count.to_le_bytes());
     out.extend_from_slice(&(central.len() as u32).to_le_bytes());
     out.extend_from_slice(&cd_offset.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes()); // comment len
+    if comment.len() > u16::MAX as usize {
+        return err(ERR_INVALID_ARG, "ZIP archive comment exceeds 65,535 bytes");
+    }
+    out.extend_from_slice(&(comment.len() as u16).to_le_bytes());
+    out.extend_from_slice(comment);
     Ok(out)
 }
 
@@ -751,6 +773,20 @@ mod tests {
         assert_eq!(filetime_to_unix(0), None);
         assert_eq!(filetime_to_unix(u64::MAX), None);
         assert_eq!(filetime_to_unix(116_444_736_000_000_000), Some(0));
+    }
+
+    #[test]
+    fn a_comment_survives_a_rewrite() {
+        let bytes = create_with_comment(&sample_entries(), b"built by hand").unwrap();
+        assert_eq!(read_comment(&bytes).unwrap(), b"built by hand");
+        assert_eq!(list(&bytes).unwrap().len(), 4);
+        // A comment containing the EOCD signature must not confuse the search.
+        let tricky = create_with_comment(&sample_entries(), b"PK\x05\x06 inside").unwrap();
+        assert_eq!(read_comment(&tricky).unwrap(), b"PK\x05\x06 inside");
+        assert_eq!(list(&tricky).unwrap().len(), 4);
+        // No comment reads as empty rather than as an error.
+        let plain = create(&sample_entries()).unwrap();
+        assert!(read_comment(&plain).unwrap().is_empty());
     }
 
     #[test]

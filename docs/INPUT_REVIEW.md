@@ -78,6 +78,26 @@ silently rather than aborting the call, while an unsafe entry *inside* the
 selection aborts with `AK_ERR_CORRUPT`. An unsafe prefix itself is
 `AK_ERR_INVALID_ARG`, not a silent no-op that reports zero files.
 
+**Duplicate and colliding entries.** Extraction now records every file path it
+writes and refuses a second entry that resolves to the same path, reporting both
+entry names as `AK_ERR_CORRUPT`. Two consequences worth stating. First, this is
+the only way an archive can make extraction fail *after* files have already
+landed, so callers should still treat a failed extraction as partial. Second,
+the comparison folds case on Windows only, so an archive containing both
+`Case.txt` and `case.txt` extracts both files on Linux and aborts on Windows —
+the honest behaviour, since the target filesystem is what decides, but it does
+mean the same archive can succeed on one platform and fail on another.
+Duplicate directory records stay tolerated (creating a directory twice is
+idempotent). This check is by path, not by inode or by filesystem identity, so
+it does not detect two names that a case-insensitive filesystem would merge in
+subtler ways (Unicode normalisation, trailing dots); `safe_join` already refuses
+trailing-dot and trailing-space names for that reason.
+
+**Directory attribute.** A ZIP entry is treated as a directory when its name
+ends with `/` or when the DOS directory attribute `0x10` is set. The second
+half is new: archives from writers that omit the trailing slash used to extract
+a zero-byte file where a directory belonged.
+
 **GNU long-name output.** TAR creation no longer refuses names that cannot be
 prefix-split: it emits a GNU `L` record (a header named `././@LongLink`) whose
 data is the NUL-terminated name, followed by the entry's own header carrying a

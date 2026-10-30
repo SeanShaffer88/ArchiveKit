@@ -185,7 +185,10 @@ pub fn list(bytes: &[u8]) -> AResult<Vec<ZipEntry>> {
             return err(ERR_CORRUPT, "central directory name overruns archive");
         }
         let name = decode_name(&bytes[name_start..name_start + name_len], flags);
-        let is_dir = name.ends_with('/');
+        // ZIP marks directories with a trailing `/`, but some writers only
+        // set the DOS directory attribute (0x10) and leave the name bare.
+        // Trusting the slash alone turned those into zero-byte files.
+        let is_dir = name.ends_with('/') || external_attributes & 0x10 != 0;
         entries.push(ZipEntry {
             meta: EntryMeta {
                 name,
@@ -454,6 +457,16 @@ mod tests {
     /// sequences this crate never writes (foreign name encodings, data
     /// descriptors) rather than only reading back its own output.
     fn hand_built(name: &[u8], data: &[u8], flags: u16, descriptor: bool) -> Vec<u8> {
+        hand_built_attrs(name, data, flags, descriptor, 0)
+    }
+
+    fn hand_built_attrs(
+        name: &[u8],
+        data: &[u8],
+        flags: u16,
+        descriptor: bool,
+        attributes: u32,
+    ) -> Vec<u8> {
         let crc = crc32(data);
         let (local_crc, local_comp, local_size) = if descriptor {
             (0, 0, 0) // sizes deferred to the trailing data descriptor
@@ -497,7 +510,7 @@ mod tests {
         out.extend_from_slice(&0u16.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&attributes.to_le_bytes()); // external attributes
         out.extend_from_slice(&0u32.to_le_bytes()); // local header offset
         out.extend_from_slice(name);
         let cd_size = out.len() - central_start;
@@ -510,6 +523,28 @@ mod tests {
         out.extend_from_slice(&cd_offset.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
         out
+    }
+
+    #[test]
+    fn directory_attribute_marks_directories_without_a_trailing_slash() {
+        // Some writers emit "folder" with the DOS directory attribute and no
+        // trailing slash; treating that as a file created a zero-byte file
+        // instead of a directory.
+        let bytes = hand_built_attrs(b"folder", b"", 0, false, 0x10);
+        let listed = list(&bytes).unwrap();
+        assert!(listed[0].meta.is_dir, "0x10 marks a directory");
+        // The trailing-slash convention still works, and a plain file with
+        // the archive bit is still a file.
+        assert!(
+            list(&hand_built(b"with-slash/", b"", 0, false)).unwrap()[0]
+                .meta
+                .is_dir
+        );
+        assert!(
+            !list(&hand_built_attrs(b"plain.txt", b"x", 0, false, 0x20)).unwrap()[0]
+                .meta
+                .is_dir
+        );
     }
 
     #[test]

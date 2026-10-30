@@ -59,7 +59,7 @@ def extract_prefix(path, dest, prefix):
     )
 
 
-def one_entry_zip(name_bytes, payload, flags):
+def one_entry_zip(name_bytes, payload, flags, attributes=0):
     """A minimal STORE archive with the name bytes exactly as given, so the
     test can emit encodings this library never writes."""
     crc = zlib.crc32(payload) & 0xFFFFFFFF
@@ -69,7 +69,7 @@ def one_entry_zip(name_bytes, payload, flags):
     ) + name_bytes + payload
     central = struct.pack(
         "<IHHHHHHIIIHHHHHII", 0x02014B50, 20, 20, flags, 0, 0, 0x21, crc,
-        len(payload), len(payload), len(name_bytes), 0, 0, 0, 0, 0, 0,
+        len(payload), len(payload), len(name_bytes), 0, 0, 0, 0, attributes, 0,
     ) + name_bytes
     eocd = struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, 1, 1, len(central), len(local), 0)
     return local + central + eocd
@@ -334,6 +334,15 @@ with tempfile.TemporaryDirectory(prefix="archivekit-interop-") as folder:
     for path in (dest / "foreign-open.txt", dest / "from-python.txt"):
         if path.exists():
             path.chmod(0o666)
+
+    # ---- directories marked only by the DOS attribute ----------------------
+    attrs_zip = root / "attrs.zip"
+    attrs_zip.write_bytes(one_entry_zip(b"folder", b"", 0, attributes=0x10))
+    entries, names = listing(attrs_zip)
+    assert entries[0]["is_dir"], entries[0]
+    dest = root / "attrs-out"
+    assert extract(attrs_zip, dest) == 0  # a directory writes no files
+    assert (dest / "folder").is_dir(), "0x10 must create a directory"
 
     # ---- traversal is refused and nothing lands outside the destination -----
     evil = root / "evil.zip"

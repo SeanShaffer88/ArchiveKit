@@ -1,18 +1,39 @@
 # ArchiveKit Roadmap
 
-**v0.1 (this build)** — ZIP (store/deflate) + TAR (ustar) create/list/
-test/extract behind a C ABI, zero dependencies, hand-written DEFLATE
-codec, traversal-safe extraction.
+**v0.1** — ZIP (store/deflate) + TAR (ustar) create/list/test/extract behind
+a C ABI, zero dependencies, hand-written DEFLATE codec, traversal-safe
+extraction.
 
-**v0.2**
-- ZIP64 read support (large archives), data-descriptor flag handling.
-- TAR long names (ustar prefix split on create; GNU 'L' records on read).
-- Dynamic-Huffman DEFLATE compression for better ratios (the decoder
-  already supports it; the encoder is fixed-Huffman in v0.1).
+**v0.2 (this build)**
+- Dynamic-Huffman DEFLATE compression: LZ77 tokens are coded per 1 MiB
+  block with dynamic Huffman codes (fixed-Huffman per block when that is
+  smaller). Measured within ~0-2% of zlib/Info-ZIP level 6 on text, prose,
+  logs and mixed binary; v0.1's fixed-Huffman output was 10-20% larger.
+- TAR long names: ustar prefix split on create (155 + 100 bytes), GNU `L`
+  records and pax `x` `path`/`size`/`mtime` records on read, with metadata
+  records consumed as structure instead of listed as entries.
+- Explicit ZIP64 refusal: classic-format overflow markers in the EOCD or a
+  central-directory entry now produce AK_ERR_NOT_SUPPORTED instead of a
+  mis-parse. ZIP64 *extras* that leave classic sizes intact stay readable.
+- Create-side budgets: entry count, per-file size and total size are
+  enforced while walking a folder, so an archive cannot be written that the
+  library could not open (classic ZIP's 16-bit entry count would otherwise
+  wrap silently).
+- Extraction parses the archive once instead of once per entry (v0.1 was
+  quadratic in entry count), removes partial files when a write fails, and
+  finds a directory by name with or without its trailing `/`.
+- TAR writer no longer panics on out-of-range timestamps; it reports them.
 
 **v0.3**
+- ZIP64 *read* support for large archives, and `data-descriptor` archives
+  whose sizes only appear in the trailing descriptor.
+- TAR GNU `L` output on create (names that cannot be prefix-split), plus
+  symlink/hardlink records behind an explicit opt-in.
+- Restore timestamps and attributes on extract (the archive already carries
+  them; extraction currently creates files with "now").
 - Streaming API for archives too large to hold in memory comfortably.
-- 7z read support evaluation (format complexity vs demand).
 
 **Later**
-- Per-entry extract-to-memory API; progress callbacks for big archives.
+- 7z read support evaluation (format complexity vs demand).
+- Per-entry extract-to-memory API; progress callbacks and cancellation for
+  big archives.

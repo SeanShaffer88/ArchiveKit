@@ -3,11 +3,13 @@
 //! dependencies. The C ABI lives in [`ffi`]; directory walking for
 //! create-from-folder lives in [`platform`].
 //!
-//! v0.1 scope (stated plainly):
+//! v0.2 scope (stated plainly):
 //! - ZIP: read + write, STORE and DEFLATE methods. No encryption, no
 //!   ZIP64, no multi-disk archives — archives needing them fail with
 //!   ERR_NOT_SUPPORTED and a specific message, never a silent misread.
-//! - TAR: read + write (ustar). Regular files and directories.
+//! - TAR: read + write (ustar). Regular files and directories. Reading
+//!   honours GNU 'L' long names and pax 'x' path/size/mtime records; writing
+//!   uses the 100-byte name field or a 155+100 byte prefix split.
 //! - Extraction rejects unsafe lexical names and detected link ancestors; entries that would
 //!   land outside the destination are refused (see [`safe_join`]).
 
@@ -19,9 +21,9 @@ pub mod platform;
 pub mod tar;
 pub mod zip;
 
-pub const VERSION: &str = "0.1.0";
+pub const VERSION: &str = "0.2.0";
 pub const VERSION_MAJOR: u32 = 0;
-pub const VERSION_MINOR: u32 = 1;
+pub const VERSION_MINOR: u32 = 2;
 pub const VERSION_PATCH: u32 = 0;
 
 pub const MAX_ARCHIVE_BYTES: usize = 256 * 1024 * 1024;

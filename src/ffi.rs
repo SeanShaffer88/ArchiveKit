@@ -64,7 +64,7 @@ fn guard<T>(f: impl FnOnce() -> AResult<T>) -> AResult<T> {
     }
 }
 
-fn read_archive(path: &str) -> AResult<(Vec<u8>, Format)> {
+fn read_archive(path: &str) -> AResult<(Vec<u8>, Format, Listed)> {
     use std::io::Read;
     let file = std::fs::File::open(path)
         .map_err(|e| (ERR_NOT_FOUND, format!("cannot read '{path}': {e}")))?;
@@ -76,17 +76,17 @@ fn read_archive(path: &str) -> AResult<(Vec<u8>, Format)> {
         return crate::err(ERR_CORRUPT, "archive exceeds 256 MiB input limit");
     }
     let fmt = detect_format(&bytes, path)?;
-    let metas = list_entries(&bytes, fmt)?;
+    let listed = list_archive(&bytes, fmt)?;
     let mut total = 0u64;
-    for m in &metas {
+    for meta in listed.metas() {
         total = total
-            .checked_add(m.size)
+            .checked_add(meta.size)
             .ok_or((ERR_CORRUPT, "archive size overflow".into()))?;
-        if m.size > crate::MAX_ENTRY_BYTES as u64 || total > crate::MAX_TOTAL_BYTES {
+        if meta.size > crate::MAX_ENTRY_BYTES as u64 || total > crate::MAX_TOTAL_BYTES {
             return crate::err(ERR_CORRUPT, "archive exceeds output budget");
         }
     }
-    Ok((bytes, fmt))
+    Ok((bytes, fmt, listed))
 }
 
 fn safe_directories(path: &Path) -> AResult<()> {
@@ -149,44 +149,88 @@ fn write_extracted(target: &Path, data: &[u8]) -> AResult<()> {
                 ),
             )
         })?;
-    output.write_all(data).map_err(|e| {
-        (
+    if let Err(e) = output.write_all(data) {
+        // Never leave a truncated file behind: it would look like a
+        // successful extraction to whatever runs next.
+        drop(output);
+        let removed = std::fs::remove_file(target);
+        return crate::err(
             ERR_PLATFORM,
-            format!("incomplete file retained at {}: {e}", target.display()),
-        )
-    })
+            match removed {
+                Ok(()) => format!(
+                    "write failed, partial file removed {}: {e}",
+                    target.display()
+                ),
+                Err(_) => format!(
+                    "write failed and the partial file could not be removed {}: {e}",
+                    target.display()
+                ),
+            },
+        );
+    }
+    Ok(())
 }
 
-fn list_entries(bytes: &[u8], fmt: Format) -> AResult<Vec<EntryMeta>> {
-    match fmt {
-        Format::Zip => Ok(zip::list(bytes)?.into_iter().map(|e| e.meta).collect()),
-        Format::Tar => Ok(tar::list(bytes)?.into_iter().map(|e| e.meta).collect()),
+/// An opened archive's entries, parsed once and reused for listing,
+/// extraction and append. v0.1 re-parsed the archive for every entry it
+/// extracted (`read_one` called `list` again per file), which made
+/// extraction quadratic in the entry count; the parsed offsets are now
+/// carried through instead.
+enum Listed {
+    Zip(Vec<zip::ZipEntry>),
+    Tar(Vec<tar::TarEntry>),
+}
+
+impl Listed {
+    fn len(&self) -> usize {
+        match self {
+            Listed::Zip(entries) => entries.len(),
+            Listed::Tar(entries) => entries.len(),
+        }
+    }
+
+    fn metas(&self) -> Vec<EntryMeta> {
+        match self {
+            Listed::Zip(entries) => entries.iter().map(|e| e.meta.clone()).collect(),
+            Listed::Tar(entries) => entries.iter().map(|e| e.meta.clone()).collect(),
+        }
+    }
+
+    fn meta_at(&self, index: usize) -> &EntryMeta {
+        match self {
+            Listed::Zip(entries) => &entries[index].meta,
+            Listed::Tar(entries) => &entries[index].meta,
+        }
+    }
+
+    /// Exact name match first. Directory entries are stored with a trailing
+    /// `/` by ZIP convention and without one by some TAR writers, so a
+    /// directory is also found when the caller's spelling differs only by
+    /// that slash (files are always matched exactly).
+    fn find(&self, name: &str) -> Option<usize> {
+        if let Some(index) = (0..self.len()).position(|i| self.meta_at(i).name == name) {
+            return Some(index);
+        }
+        let alternate = if name.ends_with('/') {
+            name.trim_end_matches('/').to_string()
+        } else {
+            format!("{name}/")
+        };
+        (0..self.len()).position(|i| self.meta_at(i).is_dir && self.meta_at(i).name == alternate)
+    }
+
+    fn read(&self, bytes: &[u8], index: usize) -> AResult<Vec<u8>> {
+        match self {
+            Listed::Zip(entries) => zip::read_entry(bytes, &entries[index]),
+            Listed::Tar(entries) => tar::read_entry(bytes, &entries[index]),
+        }
     }
 }
 
-fn read_one(bytes: &[u8], fmt: Format, name: &str) -> AResult<Option<Vec<u8>>> {
+fn list_archive(bytes: &[u8], fmt: Format) -> AResult<Listed> {
     match fmt {
-        Format::Zip => {
-            let entries = zip::list(bytes)?;
-            for e in &entries {
-                if e.meta.name == name {
-                    if e.meta.is_dir {
-                        return Ok(Some(Vec::new()));
-                    }
-                    return zip::read_entry(bytes, e).map(Some);
-                }
-            }
-            Ok(None)
-        }
-        Format::Tar => {
-            let entries = tar::list(bytes)?;
-            for e in &entries {
-                if e.meta.name == name {
-                    return tar::read_entry(bytes, e).map(Some);
-                }
-            }
-            Ok(None)
-        }
+        Format::Zip => Ok(Listed::Zip(zip::list(bytes)?)),
+        Format::Tar => Ok(Listed::Tar(tar::list(bytes)?)),
     }
 }
 
@@ -203,30 +247,32 @@ fn strip_dot_slash(name: &str) -> &str {
     n
 }
 
-fn extract_all(bytes: &[u8], fmt: Format, dest: &Path) -> AResult<u64> {
-    let metas = list_entries(bytes, fmt)?;
+fn extract_all(bytes: &[u8], listed: &Listed, dest: &Path) -> AResult<u64> {
     let mut count = 0u64;
-    for m in &metas {
-        let clean = strip_dot_slash(&m.name);
+    for index in 0..listed.len() {
+        let meta = listed.meta_at(index);
+        let clean = strip_dot_slash(&meta.name);
         if clean.is_empty() {
             // The archive root itself (e.g. GNU tar's "./" record).
-            if m.is_dir {
+            if meta.is_dir {
                 continue;
             }
             return crate::err(ERR_CORRUPT, "archive entry with an empty name");
         }
         let target = safe_join(dest, clean).ok_or((
             ERR_CORRUPT,
-            format!("entry '{}' would escape the destination; refused", m.name),
+            format!(
+                "entry '{}' would escape the destination; refused",
+                meta.name
+            ),
         ))?;
-        if m.is_dir {
+        if meta.is_dir {
             safe_directories(&target)?;
             continue;
         }
-        if let Some(data) = read_one(bytes, fmt, &m.name)? {
-            write_extracted(&target, &data)?;
-            count += 1;
-        }
+        let data = listed.read(bytes, index)?;
+        write_extracted(&target, &data)?;
+        count += 1;
     }
     Ok(count)
 }
@@ -237,7 +283,9 @@ fn extract_all(bytes: &[u8], fmt: Format, dest: &Path) -> AResult<u64> {
 
 #[no_mangle]
 pub extern "C" fn ak_version() -> *const c_char {
-    static VERSION_C: &[u8] = b"0.1.0\0";
+    // Compile-time synced with Cargo.toml so the DLL cannot claim a
+    // version the package does not have.
+    static VERSION_C: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
     VERSION_C.as_ptr() as *const c_char
 }
 
@@ -288,8 +336,8 @@ pub extern "C" fn ak_free_string(p: *mut c_char) {
 pub extern "C" fn ak_list_json(archive_utf8: *const c_char) -> *mut c_char {
     let run = guard(|| {
         let path = require_str(archive_utf8, "archive")?;
-        let (bytes, fmt) = read_archive(&path)?;
-        Ok(list_json(&list_entries(&bytes, fmt)?))
+        let (_, _, listed) = read_archive(&path)?;
+        Ok(list_json(&listed.metas()))
     });
     match run {
         Ok(json) => {
@@ -309,7 +357,7 @@ pub extern "C" fn ak_list_json(archive_utf8: *const c_char) -> *mut c_char {
 pub extern "C" fn ak_test(archive_utf8: *const c_char) -> i64 {
     let run = guard(|| {
         let path = require_str(archive_utf8, "archive")?;
-        let (bytes, fmt) = read_archive(&path)?;
+        let (bytes, fmt, _) = read_archive(&path)?;
         let n = match fmt {
             Format::Zip => zip::test(&bytes)?,
             Format::Tar => tar::test(&bytes)?,
@@ -330,7 +378,8 @@ pub extern "C" fn ak_test(archive_utf8: *const c_char) -> i64 {
 
 /// Extract. `entry_utf8` null = extract all entries. Returns the number
 /// of FILES written, or -1 on error. Any entry that would escape the
-/// destination aborts the extraction with AK_ERR_CORRUPT.
+/// destination aborts the extraction with AK_ERR_CORRUPT. A named
+/// directory extracts nothing and returns 0; its trailing `/` is optional.
 #[no_mangle]
 pub extern "C" fn ak_extract(
     archive_utf8: *const c_char,
@@ -340,31 +389,29 @@ pub extern "C" fn ak_extract(
     let run = guard(|| {
         let path = require_str(archive_utf8, "archive")?;
         let dest = require_str(dest_dir_utf8, "dest_dir")?;
-        let (bytes, fmt) = read_archive(&path)?;
+        let (bytes, _, listed) = read_archive(&path)?;
         let dest_path = Path::new(&dest);
         if entry_utf8.is_null() {
-            extract_all(&bytes, fmt, dest_path)
-        } else {
-            let name = require_str(entry_utf8, "entry")?;
-            let metas = list_entries(&bytes, fmt)?;
-            let meta = metas
-                .iter()
-                .find(|m| m.name == name)
-                .ok_or((ERR_NOT_FOUND, format!("no entry named '{name}'")))?;
-            if meta.is_dir {
-                return Ok(0);
-            }
-            let target = safe_join(dest_path, &meta.name).ok_or((
-                ERR_CORRUPT,
-                format!(
-                    "entry '{}' would escape the destination; refused",
-                    meta.name
-                ),
-            ))?;
-            let data = read_one(&bytes, fmt, &meta.name)?.unwrap_or_default();
-            write_extracted(&target, &data)?;
-            Ok(1)
+            return extract_all(&bytes, &listed, dest_path);
         }
+        let name = require_str(entry_utf8, "entry")?;
+        let index = listed
+            .find(&name)
+            .ok_or((ERR_NOT_FOUND, format!("no entry named '{name}'")))?;
+        let meta = listed.meta_at(index);
+        if meta.is_dir {
+            return Ok(0);
+        }
+        let target = safe_join(dest_path, &meta.name).ok_or((
+            ERR_CORRUPT,
+            format!(
+                "entry '{}' would escape the destination; refused",
+                meta.name
+            ),
+        ))?;
+        let data = listed.read(&bytes, index)?;
+        write_extracted(&target, &data)?;
+        Ok(1)
     });
     match run {
         Ok(n) => {
@@ -406,7 +453,8 @@ fn create_impl(archive: &str, root: &str, fmt: Format) -> AResult<i64> {
         Format::Zip => {
             let entries = collected_zip_entries(root)?;
             let n = entries.len() as i64;
-            std::fs::write(archive, zip::create(&entries))
+            let bytes = zip::create(&entries)?;
+            std::fs::write(archive, bytes)
                 .map_err(|e| (ERR_PLATFORM, format!("cannot write '{archive}': {e}")))?;
             Ok(n)
         }
@@ -495,7 +543,7 @@ pub extern "C" fn ak_zip_append(
         let archive = require_str(archive_utf8, "archive")?;
         let file = require_str(file_utf8, "file")?;
         let arcname = require_str(arcname_utf8, "arcname")?;
-        let (bytes, fmt) = read_archive(&archive)?;
+        let (bytes, fmt, listed) = read_archive(&archive)?;
         if fmt != Format::Zip {
             return crate::err(
                 crate::ERR_NOT_SUPPORTED,
@@ -503,18 +551,19 @@ pub extern "C" fn ak_zip_append(
             );
         }
         let mut entries: Vec<NewEntry> = Vec::new();
-        for e in zip::list(&bytes)? {
-            if e.meta.is_dir {
+        for index in 0..listed.len() {
+            let meta = listed.meta_at(index);
+            if meta.is_dir {
                 entries.push(NewEntry::dir(
-                    e.meta.name.trim_end_matches('/'),
-                    e.meta.modified_unix.unwrap_or(0),
+                    meta.name.trim_end_matches('/'),
+                    meta.modified_unix.unwrap_or(0),
                 ));
             } else {
-                let data = zip::read_entry(&bytes, &e)?;
+                let data = listed.read(&bytes, index)?;
                 entries.push(NewEntry::file(
-                    e.meta.name.clone(),
+                    meta.name.clone(),
                     data,
-                    e.meta.modified_unix.unwrap_or(0),
+                    meta.modified_unix.unwrap_or(0),
                 ));
             }
         }
@@ -527,7 +576,8 @@ pub extern "C" fn ak_zip_append(
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         entries.push(NewEntry::file(arcname, data, mtime));
-        std::fs::write(&archive, zip::create(&entries))
+        let bytes = zip::create(&entries)?;
+        std::fs::write(&archive, bytes)
             .map_err(|e| (ERR_PLATFORM, format!("cannot write '{archive}': {e}")))?;
         Ok(())
     });
@@ -601,6 +651,100 @@ mod tests {
         );
         assert_eq!(n, 3);
         assert_eq!(ak_test(cstr(tar_path.to_str().unwrap()).as_ptr()), 3);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ffi_single_entry_extraction() {
+        let base = std::env::temp_dir().join(format!("ak-one-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("a.txt"), b"alpha").unwrap();
+        fs::write(src.join("b.txt"), b"beta").unwrap();
+        let zip_path = base.join("one.zip");
+        fs::write(
+            &zip_path,
+            zip::create(&[
+                NewEntry::dir("sub", 0),
+                NewEntry::file("a.txt", b"alpha".to_vec(), 0),
+                NewEntry::file("b.txt", b"beta".to_vec(), 0),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        let archive = cstr(zip_path.to_str().unwrap());
+        let dest = base.join("out");
+        let dest_c = cstr(dest.to_str().unwrap());
+        // One named entry: only that file is written.
+        assert_eq!(
+            ak_extract(archive.as_ptr(), dest_c.as_ptr(), cstr("b.txt").as_ptr()),
+            1
+        );
+        assert_eq!(fs::read(dest.join("b.txt")).unwrap(), b"beta");
+        assert!(!dest.join("a.txt").exists());
+        // A directory entry extracts nothing but reports success.
+        assert_eq!(
+            ak_extract(archive.as_ptr(), dest_c.as_ptr(), cstr("sub").as_ptr()),
+            0
+        );
+        // A name that is not in the archive is NOT_FOUND.
+        assert_eq!(
+            ak_extract(archive.as_ptr(), dest_c.as_ptr(), cstr("nope").as_ptr()),
+            -1
+        );
+        assert_eq!(ak_last_error_code(), ERR_NOT_FOUND as c_int);
+        // Names are matched exactly, not as prefixes.
+        assert_eq!(
+            ak_extract(archive.as_ptr(), dest_c.as_ptr(), cstr("a.tx").as_ptr()),
+            -1
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ffi_tar_long_names_roundtrip() {
+        // 40 + '/' + 70 = 111 bytes: over the single name field, so the
+        // writer must use the ustar prefix split and the reader must
+        // reassemble it.
+        let base = std::env::temp_dir().join(format!("ak-long-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let dir = "d".repeat(40);
+        let file = "f".repeat(70);
+        let src = base.join("src");
+        fs::create_dir_all(src.join(&dir)).unwrap();
+        fs::write(src.join(&dir).join(&file), b"long tar payload").unwrap();
+        let tar_path = base.join("long.tar");
+        assert_eq!(
+            ak_create_tar(
+                cstr(tar_path.to_str().unwrap()).as_ptr(),
+                cstr(src.to_str().unwrap()).as_ptr(),
+            ),
+            2
+        );
+        assert_eq!(ak_test(cstr(tar_path.to_str().unwrap()).as_ptr()), 2);
+        let list_ptr = ak_list_json(cstr(tar_path.to_str().unwrap()).as_ptr());
+        assert!(!list_ptr.is_null());
+        // SAFETY: pointer came from this module in this test.
+        let json = unsafe { CStr::from_ptr(list_ptr) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        ak_free_string(list_ptr);
+        assert!(json.contains(&format!("\"{dir}/{file}\"")), "{json}");
+        let dest = base.join("out");
+        assert_eq!(
+            ak_extract(
+                cstr(tar_path.to_str().unwrap()).as_ptr(),
+                cstr(dest.to_str().unwrap()).as_ptr(),
+                std::ptr::null(),
+            ),
+            1
+        );
+        assert_eq!(
+            fs::read(dest.join(&dir).join(&file)).unwrap(),
+            b"long tar payload"
+        );
         let _ = fs::remove_dir_all(&base);
     }
 

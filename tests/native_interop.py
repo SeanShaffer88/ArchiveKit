@@ -272,6 +272,45 @@ with tempfile.TemporaryDirectory(prefix="archivekit-interop-") as folder:
     assert int((dest / "sub" / "f.txt").stat().st_mtime) == expected
     assert int((dest / "sub").stat().st_mtime) == expected
 
+    # ---- the read-only attribute survives create + extract -----------------
+    locked_src = root / "locked-src"
+    locked_src.mkdir()
+    (locked_src / "locked.txt").write_bytes(b"locked")
+    (locked_src / "free.txt").write_bytes(b"free")
+    locked = locked_src / "locked.txt"
+    locked.chmod(0o444)  # works on Windows too: makes the file read-only
+    arc = root / "locked.zip"
+    assert lib.ak_create_zip(str(arc).encode(), str(locked_src).encode()) == 2
+    entries, _ = listing(arc)
+    by_name = {e["name"]: e["read_only"] for e in entries}
+    assert by_name == {"locked.txt": True, "free.txt": False}, by_name
+    dest = root / "locked-out"
+    assert extract(arc, dest) == 2
+    assert not (dest / "locked.txt").stat().st_mode & 0o200, "locked.txt lost its mode"
+    assert (dest / "free.txt").stat().st_mode & 0o200, "free.txt became read-only"
+    # Also through TAR, which carries the mode field directly.
+    arc = root / "locked.tar"
+    assert lib.ak_create_tar(str(arc).encode(), str(locked_src).encode()) == 2
+    entries, _ = listing(arc)
+    assert {e["name"]: e["read_only"] for e in entries} == {
+        "locked.txt": True,
+        "free.txt": False,
+    }
+    # The attribute is restored from an archive we did not write, too.
+    foreign = root / "foreign.tar"
+    with tarfile.open(foreign, "w") as t:
+        info = tarfile.TarInfo("from-python.txt")
+        info.size = 4
+        info.mode = 0o444
+        t.addfile(info, io.BytesIO(b"py!!"))
+    dest = root / "foreign-out"
+    assert extract(foreign, dest) == 1
+    assert not (dest / "from-python.txt").stat().st_mode & 0o200
+    # Leave everything writable so the temp tree can be removed on Windows.
+    for path in (dest / "foreign-open.txt", dest / "from-python.txt"):
+        if path.exists():
+            path.chmod(0o666)
+
     # ---- traversal is refused and nothing lands outside the destination -----
     evil = root / "evil.zip"
     with zipfile.ZipFile(evil, "w") as z:
@@ -282,9 +321,16 @@ with tempfile.TemporaryDirectory(prefix="archivekit-interop-") as folder:
     assert lib.ak_last_error_code() == 7  # AK_ERR_CORRUPT
     assert not (root / "escape.txt").exists()
 
+    # Windows refuses to delete read-only files; keep the temp tree removable.
+    for path in sorted(root.rglob("*"), reverse=True):
+        try:
+            path.chmod(path.stat().st_mode | 0o600)
+        except OSError:
+            pass
+
 print(
     "Native interop passed: Python ZIP store/deflate, streaming and legacy "
     "CP437 archives and GNU/pax TAR -> DLL; DLL ZIP (dynamic Huffman) and "
-    "TAR (prefix split) -> Python; folder extraction, timestamp restoration, "
-    "ZIP64 and traversal refusals verified"
+    "TAR (prefix split) -> Python; folder extraction, timestamp and "
+    "read-only restoration, ZIP64 and traversal refusals verified"
 )

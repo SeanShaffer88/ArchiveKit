@@ -37,6 +37,17 @@ mis-parsed as corrupt or partially listed. ZIP64 *extra fields* whose central
 directory still carries classic sizes (what streaming writers emit) remain
 readable, because sizes are taken from the central directory.
 
+**Hardlinks become copies, never links.** GNU tar stores a second name for
+identical bytes as a hardlink (`type 1`), which is how backups avoid duplicating
+data; those entries used to be skipped, so the extracted tree was missing files
+that the archive described. Extraction now copies the target's bytes when the
+target is a file it has already written in the same call. The link name is
+archive data and goes through `safe_join` like any other: `../../etc/passwd`
+resolves to nothing and is reported as skipped, not followed. A forward
+reference (link before its target) is also skipped rather than resolved against
+whatever happens to be on disk. Nothing in this path can create a link, so the
+escape surface is unchanged.
+
 **Create-side omissions are reported, never silent.** The folder walk skips
 symlinks (following one is how a "backup" ends up containing `/etc` or a
 user's SSH key) and unreadable directories, and both were previously dropped

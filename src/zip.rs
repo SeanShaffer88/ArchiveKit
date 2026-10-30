@@ -324,6 +324,7 @@ pub fn list(bytes: &[u8]) -> AResult<Vec<ZipEntry>> {
                     crate::EntryKind::File
                 },
                 read_only: decode_read_only(version_made_by, external_attributes),
+                link_target: None,
             },
             method_id: method,
             local_offset: u64::try_from(local_offset as i64 + shift).map_err(|_| {

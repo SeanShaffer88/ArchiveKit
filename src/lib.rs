@@ -202,6 +202,9 @@ pub struct EntryMeta {
     /// attribute (or a Unix mode without a write bit), TAR as a mode without
     /// a write bit. Extraction re-applies it; nothing else is preserved.
     pub read_only: bool,
+    /// For a link entry, the name it points at as recorded in the archive.
+    /// Untrusted input: extraction re-checks it like any other name.
+    pub link_target: Option<String>,
 }
 
 impl EntryMeta {
@@ -215,7 +218,7 @@ impl EntryMeta {
             None => "null".to_string(),
         };
         format!(
-            "{{\"name\":\"{}\",\"size\":{},\"compressed_size\":{},\"method\":\"{}\",\"is_dir\":{},\"crc32\":{},\"modified_unix\":{},\"read_only\":{},\"type\":\"{}\"}}",
+            "{{\"name\":\"{}\",\"size\":{},\"compressed_size\":{},\"method\":\"{}\",\"is_dir\":{},\"crc32\":{},\"modified_unix\":{},\"read_only\":{},\"type\":\"{}\",\"link_target\":{}}}",
             json_escape(&self.name),
             self.size,
             self.compressed_size,
@@ -224,7 +227,11 @@ impl EntryMeta {
             crc,
             mtime,
             self.read_only,
-            self.kind.name()
+            self.kind.name(),
+            match &self.link_target {
+                Some(target) => format!("\"{}\"", json_escape(target)),
+                None => "null".to_string(),
+            }
         )
     }
 }

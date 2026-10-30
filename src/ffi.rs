@@ -385,6 +385,46 @@ fn normalize_prefix(prefix: &str) -> String {
 /// offer. Only entries that are actually selected are traversal-checked:
 /// an unsafe entry elsewhere in the archive is never written and does not
 /// abort the operation.
+/// A TAR hardlink carries no data: it says "this name is the same file as
+/// that one". Creating real hardlinks is deliberately not done (a link is a
+/// filesystem primitive an archive should not be able to aim anywhere), but
+/// dropping the entry loses a file that GNU tar wrote without a second copy
+/// of its bytes - backups routinely store the second name as a link. When the
+/// target is a file this extraction already wrote, the link becomes a copy of
+/// it, which is what the caller would have got from the original tool.
+///
+/// Returns Ok(true) when the copy was written, Ok(false) when the entry has to
+/// be reported as skipped.
+fn materialize_hardlink(
+    meta: &EntryMeta,
+    target_path: &Path,
+    dest: &Path,
+    written: &std::collections::HashSet<String>,
+) -> bool {
+    let Some(link) = meta.link_target.as_deref() else {
+        return false;
+    };
+    let clean = strip_dot_slash(link);
+    if clean.is_empty() {
+        return false;
+    }
+    // The target is archive data, so it goes through the same guard as any
+    // other name; a link pointing outside the destination is never followed.
+    let Some(source) = safe_join(dest, clean) else {
+        return false;
+    };
+    if !written.contains(&collision_key(&source)) {
+        // Either the target is not in this selection or it is not a file we
+        // wrote, so there is nothing to copy from.
+        return false;
+    }
+    if std::fs::copy(&source, target_path).is_err() {
+        return false;
+    }
+    apply_read_only(target_path, meta.read_only);
+    true
+}
+
 fn extract_prefix(bytes: &[u8], listed: &Listed, dest: &Path, prefix: &str) -> AResult<u64> {
     let prefix = normalize_prefix(prefix);
     if prefix.is_empty() {
@@ -405,6 +445,9 @@ fn extract_prefix(bytes: &[u8], listed: &Listed, dest: &Path, prefix: &str) -> A
     let mut seen_files: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut skipped: Vec<(String, crate::EntryKind)> = Vec::new();
+    // Files written by this call, and which of them are link materialisations,
+    // so a link can only ever copy something we ourselves produced.
+    let mut written: std::collections::HashSet<String> = std::collections::HashSet::new();
     for index in 0..listed.len() {
         let meta = listed.meta_at(index);
         let slashed;
@@ -449,6 +492,15 @@ fn extract_prefix(bytes: &[u8], listed: &Listed, dest: &Path, prefix: &str) -> A
             }
             continue;
         }
+        if meta.kind == crate::EntryKind::Hardlink {
+            if materialize_hardlink(meta, &target, dest, &written) {
+                written.insert(collision_key(&target));
+                count += 1;
+                continue;
+            }
+            skipped.push((meta.name.clone(), meta.kind));
+            continue;
+        }
         if !meta.kind.is_extractable() {
             skipped.push((meta.name.clone(), meta.kind));
             continue;
@@ -471,6 +523,7 @@ fn extract_prefix(bytes: &[u8], listed: &Listed, dest: &Path, prefix: &str) -> A
         let data = listed.read(bytes, index)?;
         write_extracted(&target, &data, meta.modified_unix)?;
         apply_read_only(&target, meta.read_only);
+        written.insert(collision_key(&target));
         count += 1;
     }
     apply_directory_times(directory_times);
@@ -490,6 +543,9 @@ fn extract_all(bytes: &[u8], listed: &Listed, dest: &Path) -> AResult<u64> {
     let mut seen_files: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut skipped: Vec<(String, crate::EntryKind)> = Vec::new();
+    // Files written by this call, and which of them are link materialisations,
+    // so a link can only ever copy something we ourselves produced.
+    let mut written: std::collections::HashSet<String> = std::collections::HashSet::new();
     for index in 0..listed.len() {
         let meta = listed.meta_at(index);
         let clean = strip_dot_slash(&meta.name);
@@ -517,6 +573,15 @@ fn extract_all(bytes: &[u8], listed: &Listed, dest: &Path) -> AResult<u64> {
             }
             continue;
         }
+        if meta.kind == crate::EntryKind::Hardlink {
+            if materialize_hardlink(meta, &target, dest, &written) {
+                written.insert(collision_key(&target));
+                count += 1;
+                continue;
+            }
+            skipped.push((meta.name.clone(), meta.kind));
+            continue;
+        }
         if !meta.kind.is_extractable() {
             skipped.push((meta.name.clone(), meta.kind));
             continue;
@@ -539,6 +604,7 @@ fn extract_all(bytes: &[u8], listed: &Listed, dest: &Path) -> AResult<u64> {
         let data = listed.read(bytes, index)?;
         write_extracted(&target, &data, meta.modified_unix)?;
         apply_read_only(&target, meta.read_only);
+        written.insert(collision_key(&target));
         count += 1;
     }
     apply_directory_times(directory_times);
@@ -1617,11 +1683,15 @@ mod tests {
 
     /// A header that reuses the seed's fields but renames the entry and sets a
     /// foreign typeflag. Link entries carry no data, hence the cleared size.
-    fn link_header(seed: &[u8], name: &str, typeflag: u8) -> [u8; 512] {
+    fn link_header(seed: &[u8], name: &str, typeflag: u8, target: &str) -> [u8; 512] {
         let mut block = [0u8; 512];
         block.copy_from_slice(&seed[..512]);
         block[..name.len()].copy_from_slice(name.as_bytes());
         block[name.len()] = 0;
+        // The link target lives in the 100-byte field at 157, and is what
+        // decides whether the entry can become a copy.
+        block[157..257].fill(0);
+        block[157..157 + target.len()].copy_from_slice(target.as_bytes());
         patch_typeflag(&mut block, typeflag);
         block
     }
@@ -1645,8 +1715,10 @@ mod tests {
         // create() ends the archive with two zero blocks, and the reader stops
         // there, so the link headers go before them.
         let mut archive = seed[..seed.len() - 1024].to_vec();
-        archive.extend_from_slice(&link_header(&seed, "link0.txt", b'2'));
-        archive.extend_from_slice(&link_header(&seed, "link1.txt", b'1'));
+        archive.extend_from_slice(&link_header(&seed, "link0.txt", b'2', "real.txt"));
+        archive.extend_from_slice(&link_header(&seed, "link1.txt", b'1', "real.txt"));
+        // A link aimed outside the destination must not be followed.
+        archive.extend_from_slice(&link_header(&seed, "escape.txt", b'1', "../../etc/passwd"));
         archive.extend_from_slice(&[0u8; 1024]);
         fs::write(&tar_path, &archive).unwrap();
         let archive_c = cstr(tar_path.to_str().unwrap());
@@ -1662,6 +1734,7 @@ mod tests {
         ak_free_string(list_ptr);
         assert!(json.contains(r#""type":"symlink""#), "{json}");
         assert!(json.contains(r#""type":"hardlink""#), "{json}");
+        assert!(json.contains(r#""link_target":"real.txt""#), "{json}");
         assert!(json.contains(r#""type":"file""#), "{json}");
 
         // Extraction writes what it can and reports the rest.
@@ -1672,10 +1745,16 @@ mod tests {
                 cstr(dest.to_str().unwrap()).as_ptr(),
                 std::ptr::null()
             ),
-            1
+            2
         );
         assert_eq!(fs::read(dest.join("real.txt")).unwrap(), b"hello");
+        // A hardlink whose target we wrote becomes a real copy, so GNU tar's
+        // second name for a file is not silently lost.
+        assert_eq!(fs::read(dest.join("link1.txt")).unwrap(), b"hello");
+        // A symlink is still not created, and a link aimed at ../../etc/passwd
+        // is refused rather than followed.
         assert!(!dest.join("link0.txt").exists());
+        assert!(!dest.join("escape.txt").exists());
         // SAFETY: thread-local C string owned by this module.
         let warning = unsafe { CStr::from_ptr(ak_last_warning()) }
             .to_str()
@@ -1683,6 +1762,7 @@ mod tests {
             .to_string();
         assert!(warning.contains("2 entries were skipped"), "{warning}");
         assert!(warning.contains("link0.txt"), "{warning}");
+        assert!(warning.contains("escape.txt"), "{warning}");
         // A successful call without skips clears it.
         let plain = base.join("plain.tar");
         fs::write(
@@ -1729,7 +1809,49 @@ mod tests {
             .to_string();
         assert!(message.contains("symbolic link"), "{message}");
         // The whole archive still verifies, links included.
-        assert_eq!(ak_test(archive_c.as_ptr()), 3);
+        assert_eq!(ak_test(archive_c.as_ptr()), 4);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_hardlink_is_only_materialised_after_its_target_exists() {
+        // Archives do not promise link-before-target order. Copying from a file
+        // we have not written yet would either fail or read a stale file left
+        // by an earlier run, so a forward reference is reported as skipped.
+        let base = std::env::temp_dir().join(format!("ak-forward-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let seed = tar::create(&[NewTarEntry {
+            name: "real.txt".into(),
+            data: b"body".to_vec(),
+            modified_unix: 1_792_674_000,
+            is_dir: false,
+            read_only: false,
+        }])
+        .unwrap();
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&link_header(&seed, "early.txt", b'1', "real.txt"));
+        archive.extend_from_slice(&seed);
+        let path = base.join("forward.tar");
+        fs::write(&path, &archive).unwrap();
+        let path_c = cstr(path.to_str().unwrap());
+        let dest = base.join("out");
+        assert_eq!(
+            ak_extract(
+                path_c.as_ptr(),
+                cstr(dest.to_str().unwrap()).as_ptr(),
+                std::ptr::null()
+            ),
+            1
+        );
+        assert_eq!(fs::read(dest.join("real.txt")).unwrap(), b"body");
+        assert!(!dest.join("early.txt").exists());
+        // SAFETY: thread-local C string owned by this module.
+        let warning = unsafe { CStr::from_ptr(ak_last_warning()) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(warning.contains("early.txt"), "{warning}");
         let _ = fs::remove_dir_all(&base);
     }
 

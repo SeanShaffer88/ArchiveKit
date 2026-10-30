@@ -14,7 +14,9 @@ import io
 import json
 import os
 import pathlib
+import shutil
 import struct
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -58,6 +60,21 @@ def extract_prefix(path, dest, prefix):
     return lib.ak_extract_prefix(
         str(path).encode(), str(dest).encode(), prefix.encode()
     )
+
+
+def stored_zip(name_bytes, payload, extra=b""):
+    """A minimal STORE archive carrying an arbitrary extra field."""
+    crc = zlib.crc32(payload) & 0xFFFFFFFF
+    local = struct.pack(
+        "<IHHHHHIIIHH", 0x04034B50, 20, 0, 0, 0, 0x21, crc,
+        len(payload), len(payload), len(name_bytes), len(extra),
+    ) + name_bytes + extra + payload
+    central = struct.pack(
+        "<IHHHHHHIIIHHHHHII", 0x02014B50, 20, 20, 0, 0, 0, 0x21, crc,
+        len(payload), len(payload), len(name_bytes), len(extra), 0, 0, 0, 0, 0,
+    ) + name_bytes + extra
+    eocd = struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, 1, 1, len(central), len(local), 0)
+    return local + central + eocd
 
 
 def one_entry_zip(name_bytes, payload, flags, attributes=0):
@@ -336,6 +353,45 @@ with tempfile.TemporaryDirectory(prefix="archivekit-interop-") as folder:
         if path.exists():
             path.chmod(0o666)
 
+    # ---- exact modification times from ZIP extra fields --------------------
+    # The DOS field has 2-second resolution, so writers that care add 0x5455
+    # with the real value. Ignoring it rounded 2001-01-21T12:20:01 to :02, and
+    # reported 1980 for anything older than 1980.
+    odd = 979_902_001  # odd second: not expressible in the DOS field
+    stamp = struct.pack("<HHBI", 0x5455, 5, 1, odd)
+    exact_zip = root / "exact.zip"
+    exact_zip.write_bytes(stored_zip(b"exact.txt", b"exact", stamp))
+    entries, _ = listing(exact_zip)
+    assert entries[0]["modified_unix"] == odd, entries[0]["modified_unix"]
+    exact_out = root / "exact-out"
+    assert extract(exact_zip, exact_out) == 1
+    assert int((exact_out / "exact.txt").stat().st_mtime) == odd
+    # The same archive read by Python still works, i.e. the extra is valid.
+    with zipfile.ZipFile(exact_zip) as z:
+        assert z.read("exact.txt") == b"exact"
+
+    # Real Info-ZIP output too, where the tool exists (not on Windows runners).
+    if shutil.which("zip"):
+        real = root / "infozip.txt"
+        real.write_bytes(b"real")
+        os.utime(real, (odd, odd))
+        real_zip = root / "infozip.zip"
+        subprocess.run(["zip", "-q", str(real_zip), real.name], cwd=root, check=True)
+        zip_entries, _ = listing(real_zip)
+        assert zip_entries[0]["modified_unix"] == odd, zip_entries[0]["modified_unix"]
+
+    # ---- archives with a prepended stub ------------------------------------
+    # Self-extractors and installers put their bytes in front of a normal ZIP,
+    # which shifts every recorded offset.
+    stubbed = root / "stub.zip"
+    stubbed.write_bytes(b"MZ" + b"\x00" * 254 + exact_zip.read_bytes())
+    entries, _ = listing(stubbed)
+    assert [e["name"] for e in entries] == ["exact.txt"], entries
+    stub_out = root / "stub-out"
+    assert extract(stubbed, stub_out) == 1
+    assert (stub_out / "exact.txt").read_bytes() == b"exact"
+    assert test(stubbed) == 1
+
     # ---- tarballs with links extract instead of failing --------------------
     # Most Linux tarballs contain a symlink; failing the whole extraction on
     # one made the library useless for them. The archive is built from headers
@@ -404,6 +460,6 @@ print(
     "Native interop passed: Python ZIP store/deflate, streaming and legacy "
     "CP437 archives and GNU/pax TAR -> DLL; DLL ZIP (dynamic Huffman) and "
     "TAR (prefix split, GNU long names) -> Python; folder extraction, "
-    "timestamp and read-only restoration, link skipping, ZIP64 and "
-    "traversal refusals verified"
+    "exact-timestamp, read-only and prepended-stub handling, link skipping, "
+    "ZIP64 and traversal refusals verified"
 )

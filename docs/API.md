@@ -24,6 +24,17 @@ DOS read-only attribute (ZIP) or a mode with no write bit (TAR).
 Entry names are matched exactly. A directory is also found when the
 caller writes its name with or without the trailing `/` that ZIP uses.
 
+A ZIP entry counts as a directory when its name ends with `/` **or** when it
+carries the DOS directory attribute (`0x10`) — some writers set only the
+attribute, and those entries used to extract as empty files.
+
+Two entries that would land on the same path abort the extraction with
+`AK_ERR_CORRUPT` naming both of them, since that is the archive's fault rather
+than a pre-existing file. On Windows the comparison is case-insensitive, so
+`Case.txt` and `case.txt` collide there and are both kept on Unix. Duplicate
+*directory* entries are tolerated, because listing a directory twice is
+common and harmless.
+
 ## Names
 
 Names are UTF-8 when the entry sets the UTF-8 flag (or when the bytes happen

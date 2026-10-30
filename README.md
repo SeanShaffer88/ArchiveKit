@@ -52,7 +52,8 @@ ak_zip_append("backup.zip", "extra.log", "logs/extra.log");
   lists and extracts as `café.txt` instead of `caf?`.txt. Archives written by
   streaming tools (data descriptors, flag bit 3) read fine, because sizes
   come from the central directory.
-- **Reads what the world actually writes.** ZIP store/deflate, ustar TAR,
+- **Reads what the world actually writes.** ZIP store/deflate (directories
+  detected from the trailing `/` *or* the DOS directory attribute), ustar TAR,
   and TAR long names carried the two ways they really are: GNU `L` records
   and pax `x` extended headers (`path`, `size`, `mtime`). Metadata records
   are consumed as structure, never listed as entries. On create, TAR names
@@ -69,7 +70,7 @@ ak_zip_append("backup.zip", "extra.log", "logs/extra.log");
 
 ## Verification status
 
-- 43 tests: 38 unit tests plus 5 integration tests. CRC vectors;
+- 45 tests: 40 unit tests plus 5 integration tests. CRC vectors;
   zlib-produced DEFLATE streams (embedded, byte-exact); deflate↔inflate
   roundtrips including incompressible data, window-edge data, block
   boundaries and multi-block streams; Huffman length limiting and

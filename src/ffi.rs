@@ -147,7 +147,8 @@ fn write_extracted(target: &Path, data: &[u8], mtime: Option<i64>) -> AResult<()
             (
                 ERR_PLATFORM,
                 format!(
-                    "cannot create new file {} (existing files are never overwritten): {e}",
+                    "cannot create new file {} (an earlier entry or an existing file is \
+                     never overwritten): {e}",
                     target.display()
                 ),
             )
@@ -178,6 +179,18 @@ fn write_extracted(target: &Path, data: &[u8], mtime: Option<i64>) -> AResult<()
         let _ = platform::set_mtime(target, seconds);
     }
     Ok(())
+}
+
+/// Key used to spot two archive entries that would land on the same file.
+/// Windows paths are case-insensitive, so there the key is folded; on Unix
+/// the same archive is legal and both files are written.
+fn collision_key(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        text.to_lowercase()
+    } else {
+        text
+    }
 }
 
 /// Apply a recorded read-only attribute. Files get this right after their
@@ -321,6 +334,8 @@ fn extract_prefix(bytes: &[u8], listed: &Listed, dest: &Path, prefix: &str) -> A
     let mut count = 0u64;
     let mut directory_times: Vec<(std::path::PathBuf, i64)> = Vec::new();
     let mut directory_attributes: Vec<std::path::PathBuf> = Vec::new();
+    let mut seen_files: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for index in 0..listed.len() {
         let meta = listed.meta_at(index);
         let slashed;
@@ -365,6 +380,21 @@ fn extract_prefix(bytes: &[u8], listed: &Listed, dest: &Path, prefix: &str) -> A
             }
             continue;
         }
+        // Two entries writing one path is the archive's fault, not the
+        // destination's, and the "existing file" error would blame the
+        // wrong thing. Say which two entries collide instead (this also
+        // catches case-only collisions on Windows).
+        let key = collision_key(&target);
+        if let Some(first) = seen_files.insert(key, meta.name.clone()) {
+            return crate::err(
+                ERR_CORRUPT,
+                format!(
+                    "archive has two entries that map to the same path ({} and {}); \
+                     nothing further was extracted",
+                    first, meta.name
+                ),
+            );
+        }
         let data = listed.read(bytes, index)?;
         write_extracted(&target, &data, meta.modified_unix)?;
         apply_read_only(&target, meta.read_only);
@@ -381,6 +411,8 @@ fn extract_all(bytes: &[u8], listed: &Listed, dest: &Path) -> AResult<u64> {
     let mut count = 0u64;
     let mut directory_times: Vec<(std::path::PathBuf, i64)> = Vec::new();
     let mut directory_attributes: Vec<std::path::PathBuf> = Vec::new();
+    let mut seen_files: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for index in 0..listed.len() {
         let meta = listed.meta_at(index);
         let clean = strip_dot_slash(&meta.name);
@@ -407,6 +439,21 @@ fn extract_all(bytes: &[u8], listed: &Listed, dest: &Path) -> AResult<u64> {
                 directory_attributes.push(target);
             }
             continue;
+        }
+        // Two entries writing one path is the archive's fault, not the
+        // destination's, and the "existing file" error would blame the
+        // wrong thing. Say which two entries collide instead (this also
+        // catches case-only collisions on Windows).
+        let key = collision_key(&target);
+        if let Some(first) = seen_files.insert(key, meta.name.clone()) {
+            return crate::err(
+                ERR_CORRUPT,
+                format!(
+                    "archive has two entries that map to the same path ({} and {}); \
+                     nothing further was extracted",
+                    first, meta.name
+                ),
+            );
         }
         let data = listed.read(bytes, index)?;
         write_extracted(&target, &data, meta.modified_unix)?;
@@ -1289,6 +1336,92 @@ mod tests {
         make_writable(&src.join("locked.txt"));
         make_writable(&src.join("locked-dir"));
         make_writable(&src.join("locked-dir").join("inner.txt"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ffi_duplicate_entries_are_reported_as_an_archive_fault() {
+        // An archive with the same name twice: the second write cannot
+        // create the file, and the error must say the archive is at fault
+        // rather than blaming a pre-existing file.
+        let base = std::env::temp_dir().join(format!("ak-dup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let zip_path = base.join("dup.zip");
+        fs::write(
+            &zip_path,
+            zip::create(&[
+                NewEntry::file("dup.txt", b"first".to_vec(), 0),
+                NewEntry::file("dup.txt", b"second".to_vec(), 0),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        let dest = base.join("out");
+        assert_eq!(
+            ak_extract(
+                cstr(zip_path.to_str().unwrap()).as_ptr(),
+                cstr(dest.to_str().unwrap()).as_ptr(),
+                std::ptr::null()
+            ),
+            -1
+        );
+        assert_eq!(ak_last_error_code(), ERR_CORRUPT as c_int);
+        // SAFETY: the pointer is a thread-local C string owned by this module.
+        let message = unsafe { CStr::from_ptr(ak_last_error()) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(message.contains("two entries"), "{message}");
+        assert!(message.contains("dup.txt"), "{message}");
+        // The first entry's content is what landed, untouched.
+        assert_eq!(fs::read(dest.join("dup.txt")).unwrap(), b"first");
+
+        // Directories may legitimately be listed more than once.
+        fs::write(
+            &zip_path,
+            zip::create(&[
+                NewEntry::dir("d", 0),
+                NewEntry::dir("d", 0),
+                NewEntry::file("d/a.txt", b"a".to_vec(), 0),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        let dest2 = base.join("out2");
+        assert_eq!(
+            ak_extract(
+                cstr(zip_path.to_str().unwrap()).as_ptr(),
+                cstr(dest2.to_str().unwrap()).as_ptr(),
+                std::ptr::null()
+            ),
+            1
+        );
+
+        // Case-only collisions only collide where the filesystem does.
+        fs::write(
+            &zip_path,
+            zip::create(&[
+                NewEntry::file("Case.txt", b"upper".to_vec(), 0),
+                NewEntry::file("case.txt", b"lower".to_vec(), 0),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        let dest3 = base.join("out3");
+        let result = ak_extract(
+            cstr(zip_path.to_str().unwrap()).as_ptr(),
+            cstr(dest3.to_str().unwrap()).as_ptr(),
+            std::ptr::null(),
+        );
+        if cfg!(windows) {
+            assert_eq!(result, -1, "case-insensitive target must refuse the second");
+            assert_eq!(ak_last_error_code(), ERR_CORRUPT as c_int);
+        } else {
+            assert_eq!(result, 2, "case-sensitive target keeps both files");
+            assert_eq!(fs::read(dest3.join("Case.txt")).unwrap(), b"upper");
+            assert_eq!(fs::read(dest3.join("case.txt")).unwrap(), b"lower");
+        }
         let _ = fs::remove_dir_all(&base);
     }
 

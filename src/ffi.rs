@@ -289,7 +289,13 @@ fn strip_prefix_component<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
 /// segments and any trailing `/` are removed.
 fn normalize_prefix(prefix: &str) -> String {
     let slashed = prefix.replace('\\', "/");
-    strip_dot_slash(&slashed).trim_end_matches('/').to_string()
+    let trimmed = strip_dot_slash(&slashed).trim_end_matches('/');
+    // "." and "./" both mean the archive root, not a folder named ".".
+    if trimmed == "." {
+        String::new()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Extract the folder `prefix` and everything below it. The prefix itself
@@ -995,8 +1001,23 @@ mod tests {
             1
         );
         assert_eq!(fs::read(dest5.join("c.txt")).unwrap(), b"c");
+        // "." and "./" mean the archive root, so they extract everything;
+        // an empty prefix and "/" do the same.
+        for root_prefix in [".", "./", "", "/"] {
+            let dest_root = base.join(format!("root-{}", root_prefix.replace('/', "_")));
+            assert_eq!(
+                ak_extract_prefix(
+                    archive.as_ptr(),
+                    cstr(dest_root.to_str().unwrap()).as_ptr(),
+                    cstr(root_prefix).as_ptr()
+                ),
+                5, // every file in the archive: a, deep/b, other/c, docsx/d, top
+                "{root_prefix:?}"
+            );
+            assert_eq!(fs::read(dest_root.join("top.txt")).unwrap(), b"t");
+        }
         // Unsafe prefixes are refused rather than silently matching nothing.
-        for bad in ["..", "../docs", "C:/docs", "/docs"] {
+        for bad in ["..", "../docs", "C:/docs", "/docs", "docs/../x"] {
             assert_eq!(
                 ak_extract_prefix(archive.as_ptr(), dest_c.as_ptr(), cstr(bad).as_ptr()),
                 -1,

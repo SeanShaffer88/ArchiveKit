@@ -353,6 +353,33 @@ with tempfile.TemporaryDirectory(prefix="archivekit-interop-") as folder:
         if path.exists():
             path.chmod(0o666)
 
+    # ---- appending to a foreign archive keeps its comment ------------------
+    # Python writes the archive and its comment; the DLL appends a file. The
+    # comment is data about the archive, not about the entries, so a rewrite
+    # that drops it loses something the caller never asked to change.
+    commented = root / "commented.zip"
+    with zipfile.ZipFile(commented, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("original.txt", "original")
+        z.comment = b"kept by the interop test"
+    appended = root / "appended.txt"
+    appended.write_bytes(b"appended")
+    assert lib.ak_zip_append(
+        str(commented).encode(), str(appended).encode(), b"added/appended.txt"
+    ) == 0, lib.ak_last_error()
+    with zipfile.ZipFile(commented) as z:
+        assert z.comment == b"kept by the interop test", z.comment
+        assert z.read("added/appended.txt") == b"appended"
+        assert z.read("original.txt") == b"original"
+    # A name that would escape when another tool extracts it is refused, as is
+    # a duplicate: the archive stays exactly as it was.
+    before = commented.read_bytes()
+    for bad in ("../escape.txt", "/absolute.txt", "added/appended.txt", ""):
+        code = lib.ak_zip_append(
+            str(commented).encode(), str(appended).encode(), bad.encode()
+        )
+        assert code == 1, (bad, code)  # AK_ERR_INVALID_ARG
+    assert commented.read_bytes() == before
+
     # ---- exact modification times from ZIP extra fields --------------------
     # The DOS field has 2-second resolution, so writers that care add 0x5455
     # with the real value. Ignoring it rounded 2001-01-21T12:20:01 to :02, and

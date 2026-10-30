@@ -1002,9 +1002,17 @@ mod tests {
         );
         assert_eq!(fs::read(dest5.join("c.txt")).unwrap(), b"c");
         // "." and "./" mean the archive root, so they extract everything;
-        // an empty prefix and "/" do the same.
-        for root_prefix in [".", "./", "", "/"] {
-            let dest_root = base.join(format!("root-{}", root_prefix.replace('/', "_")));
+        // an empty prefix and "/" do the same. The destination names are
+        // explicit labels, not derived from the prefix: Win32 strips a
+        // trailing dot from a path component, so "root-." would silently
+        // become "root-" and collide with the empty-prefix case.
+        for (label, root_prefix) in [
+            ("dot", "."),
+            ("dot-slash", "./"),
+            ("empty", ""),
+            ("slash", "/"),
+        ] {
+            let dest_root = base.join(format!("root-{label}"));
             assert_eq!(
                 ak_extract_prefix(
                     archive.as_ptr(),

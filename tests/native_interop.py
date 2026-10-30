@@ -13,10 +13,12 @@ import ctypes
 import io
 import json
 import pathlib
+import struct
 import sys
 import tarfile
 import tempfile
 import zipfile
+import zlib
 
 lib = ctypes.CDLL(str(pathlib.Path(sys.argv[1]).resolve()))
 lib.ak_test.restype = ctypes.c_int64
@@ -27,6 +29,8 @@ for name in ("ak_create_zip", "ak_create_tar"):
     fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
 lib.ak_extract.restype = ctypes.c_int64
 lib.ak_extract.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
+lib.ak_extract_prefix.restype = ctypes.c_int64
+lib.ak_extract_prefix.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
 lib.ak_list_json.restype = ctypes.c_void_p
 lib.ak_list_json.argtypes = [ctypes.c_char_p]
 lib.ak_free_string.argtypes = [ctypes.c_void_p]
@@ -46,6 +50,28 @@ def listing(path):
 
 def test(path):
     return lib.ak_test(str(path).encode())
+
+
+def extract_prefix(path, dest, prefix):
+    return lib.ak_extract_prefix(
+        str(path).encode(), str(dest).encode(), prefix.encode()
+    )
+
+
+def one_entry_zip(name_bytes, payload, flags):
+    """A minimal STORE archive with the name bytes exactly as given, so the
+    test can emit encodings this library never writes."""
+    crc = zlib.crc32(payload) & 0xFFFFFFFF
+    local = struct.pack(
+        "<IHHHHHIIIHH", 0x04034B50, 20, flags, 0, 0, 0x21, crc,
+        len(payload), len(payload), len(name_bytes), 0,
+    ) + name_bytes + payload
+    central = struct.pack(
+        "<IHHHHHHIIIHHHHHII", 0x02014B50, 20, 20, flags, 0, 0, 0x21, crc,
+        len(payload), len(payload), len(name_bytes), 0, 0, 0, 0, 0, 0,
+    ) + name_bytes
+    eocd = struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, 1, 1, len(central), len(local), 0)
+    return local + central + eocd
 
 
 def extract(path, dest, entry=None):
@@ -155,6 +181,70 @@ with tempfile.TemporaryDirectory(prefix="archivekit-interop-") as folder:
     assert lib.ak_last_error_code() == 2  # AK_ERR_NOT_SUPPORTED
     assert b"ZIP64" in lib.ak_last_error(), lib.ak_last_error()
 
+    # ---- legacy CP437 names decode correctly (APPNOTE 4.4.4) ----------------
+    # 0x82 is 'é' in CP437: the DOS-era spelling of "café-pré.txt". Without
+    # the UTF-8 flag these bytes are CP437, not UTF-8.
+    legacy = root / "legacy.zip"
+    legacy.write_bytes(one_entry_zip(b"caf\x82-pr\x82.txt", b"legacy", 0))
+    entries, names = listing(legacy)
+    assert names == ["café-pré.txt"], names
+    dest = root / "legacy-out"
+    assert extract(legacy, dest) == 1
+    assert (dest / "café-pré.txt").read_bytes() == b"legacy"
+    # Flagged UTF-8 is read as UTF-8 and left alone.
+    modern = root / "modern.zip"
+    modern.write_bytes(one_entry_zip("café-pré.txt".encode(), b"modern", 0x0800))
+    assert listing(modern)[1] == ["café-pré.txt"]
+
+    # ---- streaming archives (data descriptors) are readable ----------------
+    class Unseekable(io.RawIOBase):
+        def __init__(self, handle):
+            self.handle = handle
+
+        def writable(self):
+            return True
+
+        def write(self, data):
+            return self.handle.write(data)
+
+        def seekable(self):
+            return False
+
+    streamed = root / "streamed.zip"
+    streamed_payload = b"data descriptor payload" * 100
+    with open(streamed, "wb") as raw:
+        with zipfile.ZipFile(Unseekable(raw), "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("streamed.txt", streamed_payload)
+    assert struct.unpack_from("<H", streamed.read_bytes(), 6)[0] & 0x8, "no descriptor bit"
+    assert test(streamed) == 1, lib.ak_last_error()
+    dest = root / "streamed-out"
+    assert extract(streamed, dest) == 1
+    assert (dest / "streamed.txt").read_bytes() == streamed_payload
+
+    # ---- ak_extract_prefix extracts one folder, prefix stripped ------------
+    tree = root / "tree.zip"
+    with zipfile.ZipFile(tree, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("docs/api/a.txt", b"a")
+        z.writestr("docs/api/deep/b.txt", b"b")
+        z.writestr("docs/other/c.txt", b"c")
+        z.writestr("docsx/d.txt", b"d")
+        z.writestr("top.txt", b"t")
+    dest = root / "api-out"
+    assert extract_prefix(tree, dest, "docs/api") == 2
+    assert (dest / "a.txt").read_bytes() == b"a"
+    assert (dest / "deep" / "b.txt").read_bytes() == b"b"
+    assert not (dest / "api").exists() and not (dest / "other").exists()
+    # Component boundaries: "doc" and "docsx" select nothing.
+    assert extract_prefix(tree, root / "miss1", "doc") == 0
+    assert extract_prefix(tree, root / "miss2", "docs/api/deeper") == 0
+    # Whole top-level folder, still excluding the look-alike "docsx".
+    dest = root / "docs-out"
+    assert extract_prefix(tree, dest, "docs/") == 3
+    assert (dest / "other" / "c.txt").read_bytes() == b"c"
+    # An unsafe prefix is an argument error, not a silent no-op.
+    assert extract_prefix(tree, root / "bad", "../docs") == -1
+    assert lib.ak_last_error_code() == 1  # AK_ERR_INVALID_ARG
+
     # ---- traversal is refused and nothing lands outside the destination -----
     evil = root / "evil.zip"
     with zipfile.ZipFile(evil, "w") as z:
@@ -166,7 +256,8 @@ with tempfile.TemporaryDirectory(prefix="archivekit-interop-") as folder:
     assert not (root / "escape.txt").exists()
 
 print(
-    "Native interop passed: Python ZIP store/deflate and GNU/pax TAR -> DLL; "
-    "DLL ZIP (dynamic Huffman) and TAR (prefix split) -> Python; ZIP64 and "
-    "traversal refusals verified"
+    "Native interop passed: Python ZIP store/deflate, streaming and legacy "
+    "CP437 archives and GNU/pax TAR -> DLL; DLL ZIP (dynamic Huffman) and "
+    "TAR (prefix split) -> Python; folder extraction, ZIP64 and traversal "
+    "refusals verified"
 )

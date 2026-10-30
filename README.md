@@ -17,6 +17,7 @@ ak_free_string(entries);
 ak_test("backup.zip");                                    // verify: count or -1
 ak_extract("backup.zip", "C:\\Restore", NULL);            // extract all
 ak_extract("backup.zip", "C:\\Restore", "docs/report.txt"); // extract one
+ak_extract_prefix("backup.zip", "C:\\Restore", "docs/api"); // extract a folder
 ak_zip_append("backup.zip", "extra.log", "logs/extra.log");
 ```
 
@@ -38,6 +39,12 @@ ak_zip_append("backup.zip", "extra.log", "logs/extra.log");
 - **Traversal-safe by construction.** Every extraction path is joined
   through a guard that refuses absolute paths, drive-relative names, and
   `..` escapes — archives are untrusted input.
+- **Legacy names decode instead of turning into mojibake.** ZIP names are
+  UTF-8 when flagged (or when the bytes are valid UTF-8), otherwise CP437 per
+  APPNOTE 4.4.4 — so a DOS-era name stored as `caf` + byte 0x82 + `.txt`
+  lists and extracts as `café.txt` instead of `caf?`.txt. Archives written by
+  streaming tools (data descriptors, flag bit 3) read fine, because sizes
+  come from the central directory.
 - **Reads what the world actually writes.** ZIP store/deflate, ustar TAR,
   and TAR long names carried the two ways they really are: GNU `L` records
   and pax `x` extended headers (`path`, `size`, `mtime`). Metadata records

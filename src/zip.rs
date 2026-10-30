@@ -63,6 +63,51 @@ fn find_eocd(bytes: &[u8]) -> AResult<usize> {
     err(ERR_CORRUPT, "end of central directory not found")
 }
 
+/// IBM code page 437 for bytes 0x80..=0xFF, the encoding APPNOTE 4.4.4
+/// assigns to ZIP names that do not set the UTF-8 flag. Legacy Windows
+/// tools (and DOS-era archives) store names this way; without this table a
+/// name like "caf\x82.txt" came out as "caf\u{fffd}.txt".
+const CP437_HIGH: [char; 128] = [
+    '\u{00c7}', '\u{00fc}', '\u{00e9}', '\u{00e2}', '\u{00e4}', '\u{00e0}', '\u{00e5}', '\u{00e7}',
+    '\u{00ea}', '\u{00eb}', '\u{00e8}', '\u{00ef}', '\u{00ee}', '\u{00ec}', '\u{00c4}', '\u{00c5}',
+    '\u{00c9}', '\u{00e6}', '\u{00c6}', '\u{00f4}', '\u{00f6}', '\u{00f2}', '\u{00fb}', '\u{00f9}',
+    '\u{00ff}', '\u{00d6}', '\u{00dc}', '\u{00a2}', '\u{00a3}', '\u{00a5}', '\u{20a7}', '\u{0192}',
+    '\u{00e1}', '\u{00ed}', '\u{00f3}', '\u{00fa}', '\u{00f1}', '\u{00d1}', '\u{00aa}', '\u{00ba}',
+    '\u{00bf}', '\u{2310}', '\u{00ac}', '\u{00bd}', '\u{00bc}', '\u{00a1}', '\u{00ab}', '\u{00bb}',
+    '\u{2591}', '\u{2592}', '\u{2593}', '\u{2502}', '\u{2524}', '\u{2561}', '\u{2562}', '\u{2556}',
+    '\u{2555}', '\u{2563}', '\u{2551}', '\u{2557}', '\u{255d}', '\u{255c}', '\u{255b}', '\u{2510}',
+    '\u{2514}', '\u{2534}', '\u{252c}', '\u{251c}', '\u{2500}', '\u{253c}', '\u{255e}', '\u{255f}',
+    '\u{255a}', '\u{2554}', '\u{2569}', '\u{2566}', '\u{2560}', '\u{2550}', '\u{256c}', '\u{2567}',
+    '\u{2568}', '\u{2564}', '\u{2565}', '\u{2559}', '\u{2558}', '\u{2552}', '\u{2553}', '\u{256b}',
+    '\u{256a}', '\u{2518}', '\u{250c}', '\u{2588}', '\u{2584}', '\u{258c}', '\u{2590}', '\u{2580}',
+    '\u{03b1}', '\u{00df}', '\u{0393}', '\u{03c0}', '\u{03a3}', '\u{03c3}', '\u{00b5}', '\u{03c4}',
+    '\u{03a6}', '\u{0398}', '\u{03a9}', '\u{03b4}', '\u{221e}', '\u{03c6}', '\u{03b5}', '\u{2229}',
+    '\u{2261}', '\u{00b1}', '\u{2265}', '\u{2264}', '\u{2320}', '\u{2321}', '\u{00f7}', '\u{2248}',
+    '\u{00b0}', '\u{2219}', '\u{00b7}', '\u{221a}', '\u{207f}', '\u{00b2}', '\u{25a0}', '\u{00a0}',
+];
+
+fn decode_name(raw: &[u8], flags: u16) -> String {
+    const UTF8_FLAG: u16 = 0x0800;
+    if flags & UTF8_FLAG != 0 || raw.is_ascii() {
+        return String::from_utf8_lossy(raw).into_owned();
+    }
+    // No UTF-8 flag but the bytes are valid UTF-8: some writers forget the
+    // flag. Trusting the bytes beats mojibake in both directions, because
+    // genuine CP437 high bytes are almost never valid UTF-8.
+    if let Ok(text) = std::str::from_utf8(raw) {
+        return text.to_string();
+    }
+    raw.iter()
+        .map(|&b| {
+            if b < 0x80 {
+                b as char
+            } else {
+                CP437_HIGH[(b - 0x80) as usize]
+            }
+        })
+        .collect()
+}
+
 pub fn list(bytes: &[u8]) -> AResult<Vec<ZipEntry>> {
     let eocd = find_eocd(bytes)?;
     let disk = u16le(bytes, eocd + 4)?;
@@ -124,7 +169,7 @@ pub fn list(bytes: &[u8]) -> AResult<Vec<ZipEntry>> {
         if name_start + name_len > bytes.len() {
             return err(ERR_CORRUPT, "central directory name overruns archive");
         }
-        let name = String::from_utf8_lossy(&bytes[name_start..name_start + name_len]).into_owned();
+        let name = decode_name(&bytes[name_start..name_start + name_len], flags);
         let is_dir = name.ends_with('/');
         entries.push(ZipEntry {
             meta: EntryMeta {
@@ -381,6 +426,103 @@ mod tests {
         assert_eq!(data, b"hello world, hello zip!");
         let big = read_entry(&bytes, &listed[2]).unwrap();
         assert_eq!(big.len(), 4500);
+    }
+
+    /// Hand-build a one-entry STORE archive so tests can emit byte
+    /// sequences this crate never writes (foreign name encodings, data
+    /// descriptors) rather than only reading back its own output.
+    fn hand_built(name: &[u8], data: &[u8], flags: u16, descriptor: bool) -> Vec<u8> {
+        let crc = crc32(data);
+        let (local_crc, local_comp, local_size) = if descriptor {
+            (0, 0, 0) // sizes deferred to the trailing data descriptor
+        } else {
+            (crc, data.len() as u32, data.len() as u32)
+        };
+        let mut out = Vec::new();
+        out.extend_from_slice(&SIG_LOCAL.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&flags.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // store
+        out.extend_from_slice(&0u16.to_le_bytes()); // time
+        out.extend_from_slice(&0x21u16.to_le_bytes()); // date
+        out.extend_from_slice(&local_crc.to_le_bytes());
+        out.extend_from_slice(&local_comp.to_le_bytes());
+        out.extend_from_slice(&local_size.to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(name);
+        out.extend_from_slice(data);
+        if descriptor {
+            out.extend_from_slice(&0x0807_4b50u32.to_le_bytes()); // data descriptor
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        }
+        let cd_offset = out.len() as u32;
+        let central_start = out.len();
+        out.extend_from_slice(&SIG_CENTRAL.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&flags.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0x21u16.to_le_bytes());
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // local header offset
+        out.extend_from_slice(name);
+        let cd_size = out.len() - central_start;
+        out.extend_from_slice(&SIG_EOCD.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&(cd_size as u32).to_le_bytes());
+        out.extend_from_slice(&cd_offset.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn legacy_cp437_names_are_decoded() {
+        // APPNOTE 4.4.4: without the UTF-8 flag, names are CP437. 0x82 is
+        // 'é', so this is the DOS-era spelling of "café-pré.txt" and used
+        // to surface as replacement characters.
+        let bytes = hand_built(b"caf\x82-pr\x82.txt", b"legacy name", 0, false);
+        let listed = list(&bytes).unwrap();
+        assert_eq!(listed[0].meta.name, "café-pré.txt");
+        assert_eq!(read_entry(&bytes, &listed[0]).unwrap(), b"legacy name");
+        // Box-drawing characters are a different byte in CP437 than in
+        // UTF-8, so this also pins the table beyond the Latin-1 range.
+        let bytes = hand_built(b"\xc9\xcd\xbb.txt", b"x", 0, false);
+        assert_eq!(list(&bytes).unwrap()[0].meta.name, "╔═╗.txt");
+        // Writers that set the UTF-8 flag are read as UTF-8 and left alone.
+        let bytes = hand_built("café-pré.txt".as_bytes(), b"x", 0x0800, false);
+        assert_eq!(list(&bytes).unwrap()[0].meta.name, "café-pré.txt");
+        // Valid UTF-8 *without* the flag: trust the bytes rather than
+        // rendering real UTF-8 as CP437 mojibake.
+        let bytes = hand_built("café-pré.txt".as_bytes(), b"x", 0, false);
+        assert_eq!(list(&bytes).unwrap()[0].meta.name, "café-pré.txt");
+    }
+
+    #[test]
+    fn data_descriptor_archives_are_read_from_the_central_directory() {
+        // Streaming writers (flag bit 3) put zero sizes in the local header
+        // and the real values in a trailing descriptor. Sizes come from the
+        // central directory, so the local placeholder must not matter.
+        let bytes = hand_built(b"streamed.txt", b"streamed payload", 0x0008, true);
+        let listed = list(&bytes).unwrap();
+        assert_eq!(listed[0].meta.size, 16);
+        assert_eq!(listed[0].meta.compressed_size, 16);
+        assert_eq!(read_entry(&bytes, &listed[0]).unwrap(), b"streamed payload");
+        assert_eq!(test(&bytes).unwrap(), 1);
     }
 
     #[test]

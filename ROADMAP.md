@@ -9,6 +9,14 @@ extraction.
   block with dynamic Huffman codes (fixed-Huffman per block when that is
   smaller). Measured within ~0-2% of zlib/Info-ZIP level 6 on text, prose,
   logs and mixed binary; v0.1's fixed-Huffman output was 10-20% larger.
+- New ABI call `ak_extract_prefix`: extract one folder with the prefix
+  stripped from the written paths, matched on path component boundaries.
+  Only selected entries are traversal-checked, so a hostile entry elsewhere
+  in the archive cannot block a clean folder extraction.
+- Legacy name decoding: unflagged ZIP names are CP437 per APPNOTE 4.4.4
+  (UTF-8 when flagged, or when the bytes are valid UTF-8), so DOS-era names
+  list and extract correctly instead of as replacement characters.
+  Streaming archives (`data-descriptor`, flag bit 3) are verified readable.
 - TAR long names: ustar prefix split on create (155 + 100 bytes), GNU `L`
   records and pax `x` `path`/`size`/`mtime` records on read, with metadata
   records consumed as structure instead of listed as entries.

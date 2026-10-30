@@ -10,6 +10,7 @@ Authoritative declaration: `../include/archivekit.h`.
 | `ak_test(path)` | entry count after full verification, -1 on error |
 | `ak_extract(path, dest, NULL)` | files written extracting everything |
 | `ak_extract(path, dest, "name")` | 1 extracting one entry (0 if it is a directory) |
+| `ak_extract_prefix(path, dest, "folder")` | files written extracting that folder and everything below it (prefix stripped) |
 | `ak_create_zip(path, root_dir)` | entries archived |
 | `ak_create_tar(path, root_dir)` | entries archived |
 | `ak_zip_append(path, file, arcname)` | AK_OK or AK_ERR_* |
@@ -21,6 +22,33 @@ back to the extension. Listing JSON per entry:
 
 Entry names are matched exactly. A directory is also found when the
 caller writes its name with or without the trailing `/` that ZIP uses.
+
+## Names
+
+Names are UTF-8 when the entry sets the UTF-8 flag (or when the bytes happen
+to be valid UTF-8); otherwise they are decoded as legacy CP437, which is what
+APPNOTE 4.4.4 assigns to unflagged names and what DOS-era Windows tools
+wrote. The high half of CP437 is all non-ASCII printable characters, so this
+decoding cannot introduce a path separator, drive colon or device name — the
+traversal guard still sees exactly one place where separators can appear.
+
+## Extracting a folder
+
+`ak_extract_prefix` selects an entry when its name is the prefix or starts
+with `prefix/` (component boundaries, `\` accepted as a separator), then
+writes the remainder below it:
+
+```
+docs/api/a.txt        + prefix "docs/api"  ->  <dest>/a.txt
+docs/api/deep/b.txt                         ->  <dest>/deep/b.txt
+docs/other/c.txt                            ->  not selected
+docsx/d.txt                                 ->  not selected ("docsx" != "docs")
+```
+
+Only selected entries are traversal-checked: a hostile entry elsewhere in the
+archive is never written and does not abort the operation, while one inside
+the selection aborts with `AK_ERR_CORRUPT`. An unsafe prefix (`..`, absolute,
+drive-relative) is `AK_ERR_INVALID_ARG` rather than a silent no-op.
 
 ## Limits
 

@@ -76,6 +76,8 @@ struct Pending {
     path: Option<String>,
     size: Option<u64>,
     mtime: Option<i64>,
+    /// GNU 'K' record: the link target when it does not fit the header.
+    link_name: Option<String>,
 }
 
 /// Parse pax `"<len> <key>=<value>\n"` records. Unknown keys are ignored;
@@ -185,9 +187,9 @@ pub fn list(bytes: &[u8]) -> AResult<Vec<TarEntry>> {
             let data = &bytes[data_offset..data_offset + header_size as usize];
             match typeflag {
                 b'L' => pending.name = Some(read_str(data)),
+                b'K' => pending.link_name = Some(read_str(data)),
                 b'x' | b'X' => apply_pax(&mut pending, data)?,
-                // 'K' (long link name) and 'g' (global pax header) carry
-                // nothing this library acts on.
+                // 'g' (global pax header) carries nothing this library acts on.
                 _ => {}
             }
             off = header_end as usize;
@@ -237,6 +239,14 @@ pub fn list(bytes: &[u8]) -> AResult<Vec<TarEntry>> {
                 // A zero mode means "not recorded"; only a real mode with no
                 // write bit at all counts as read-only.
                 read_only: mode != 0 && mode & 0o200 == 0,
+                link_target: pending
+                    .link_name
+                    .take()
+                    .or_else(|| {
+                        let recorded = read_str(&block[157..257]);
+                        (!recorded.is_empty()).then_some(recorded)
+                    })
+                    .filter(|_| matches!(typeflag, b'1' | b'2')),
             },
             data_offset,
             typeflag,

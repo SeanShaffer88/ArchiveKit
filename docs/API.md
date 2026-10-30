@@ -20,13 +20,18 @@ back to the extension. Listing JSON per entry:
 `{"name","size","compressed_size","method","is_dir","crc32","modified_unix","read_only","type"}`
 — crc32 is a hex string for ZIP entries, null for TAR; read_only reflects the
 DOS read-only attribute (ZIP) or a mode with no write bit (TAR); `type` is
-`file`, `dir`, `symlink`, `hardlink`, `sparse` or `other`.
+`file`, `dir`, `symlink`, `hardlink`, `sparse` or `other`, plus
+`link_target` (the name a link points at, or null).
 
 ## What gets extracted
 
-Regular files and directories are written. TAR entries of any other kind —
-symbolic links, hard links, device nodes, FIFOs, GNU sparse members — are
-**skipped** and counted in `ak_last_warning()`, because Windows cannot recreate them without privilege
+Regular files and directories are written. A TAR **hardlink** whose target
+this extraction already wrote becomes a **copy** of it: the archive carried
+only one copy of those bytes, and dropping the second name silently lost a
+file. Real links are never created (a link is the classic escape primitive),
+and a hardlink pointing outside the destination, or forward to a file not yet
+written, is skipped like the rest. Symbolic links, device nodes, FIFOs and GNU
+sparse members are **skipped** and counted in `ak_last_warning()`, because Windows cannot recreate them without privilege
 and failing the whole extraction over one link made ordinary tarballs
 unusable. The call still succeeds and returns the number of files written:
 

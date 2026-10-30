@@ -444,11 +444,14 @@ with tempfile.TemporaryDirectory(prefix="archivekit-interop-") as folder:
     assert kinds == {"real.txt": "file", "sym.txt": "symlink", "hard.txt": "hardlink"}, kinds
     assert test(link_arc) == 3
     dest = root / "links-out"
-    assert extract(link_arc, dest) == 1
+    assert extract(link_arc, dest) == 2
     assert (dest / "real.txt").read_bytes() == b"real content"
+    # A hardlink is a second name for bytes the archive already carries, so it
+    # becomes a copy; the symlink is still not created.
+    assert (dest / "hard.txt").read_bytes() == b"real content"
     warning = lib.ak_last_warning().decode()
-    assert "2 entries were skipped" in warning, warning
-    assert not (dest / "sym.txt").exists() and not (dest / "hard.txt").exists()
+    assert "1 entry was skipped" in warning, warning
+    assert not (dest / "sym.txt").exists()
     # A later call that skips nothing clears the warning.
     assert extract(link_arc, root / "links-out2", "real.txt") == 1
     assert lib.ak_last_warning().decode() == ""
@@ -487,6 +490,6 @@ print(
     "Native interop passed: Python ZIP store/deflate, streaming and legacy "
     "CP437 archives and GNU/pax TAR -> DLL; DLL ZIP (dynamic Huffman) and "
     "TAR (prefix split, GNU long names) -> Python; folder extraction, "
-    "exact-timestamp, read-only and prepended-stub handling, link skipping, "
-    "ZIP64 and traversal refusals verified"
+    "exact-timestamp, read-only and prepended-stub handling, hardlink "
+    "materialisation, ZIP64 and traversal refusals verified"
 )

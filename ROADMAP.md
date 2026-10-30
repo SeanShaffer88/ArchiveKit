@@ -49,6 +49,9 @@ extraction.
   reported 1980. Other extra tags are still skipped.
 - Archives with a self-extractor stub in front (prepended bytes, short recorded
   offsets) are located from the EOCD instead of failing on the first record.
+- TAR hardlinks are materialised as copies when their target was written by the
+  same extraction, so a backup's second names are not silently lost; unsafe or
+  forward references are reported through `ak_last_warning()`.
 - TAR v7 (pre-ustar) headers are read, recognised by their checksum, and
   gzip/bzip2/xz/zstd/7z/RAR input is named as such instead of "unknown format".
 - GNU sparse members report `type: sparse` and are skipped with a warning

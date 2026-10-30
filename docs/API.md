@@ -101,9 +101,11 @@ non-UTF-8 arguments). Details via `ak_last_error()` (thread-local).
   an optimal parser: expect a few percent behind `-9` on some inputs.
 - `ak_zip_append` rewrites the archive (entries re-encoded); content is
   preserved, byte layout is not.
-- TAR *writing* is ustar only: names must fit the 155+100 byte prefix
-  split. Longer names are refused — GNU `L` output is roadmap. Reading
-  handles GNU `L` and pax `x` records, so those archives extract fine.
+- TAR *writing* is ustar, with one exception: a name that cannot be
+  expressed as a 155+100 byte prefix split is written as a GNU `L` record,
+  which GNU tar, bsdtar, 7-Zip and Python's tarfile read (strict ustar-only
+  readers will see the truncated name). Reading handles GNU `L` and pax `x`
+  records. Long-name records are capped at 64 KiB, matching the reader.
 - Attributes: only the read-only bit round-trips (see above).
 - Timestamps: ZIP stores DOS time (2-second resolution, 1980-2107); TAR
   stores whole seconds. Extraction restores the archive's modified time on

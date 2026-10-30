@@ -26,6 +26,9 @@ extraction.
   (UTF-8 when flagged, or when the bytes are valid UTF-8), so DOS-era names
   list and extract correctly instead of as replacement characters.
   Streaming archives (`data-descriptor`, flag bit 3) are verified readable.
+- TAR long-name *output*: names that cannot be prefix-split are written as
+  a GNU `L` record (capped at 64 KiB, the reader's metadata limit) instead of
+  failing the whole archive. Names that fit stay plain ustar.
 - TAR long names: ustar prefix split on create (155 + 100 bytes), GNU `L`
   records and pax `x` `path`/`size`/`mtime` records on read, with metadata
   records consumed as structure instead of listed as entries.
@@ -44,8 +47,8 @@ extraction.
 **v0.3**
 - ZIP64 *read* support for large archives, and `data-descriptor` archives
   whose sizes only appear in the trailing descriptor.
-- TAR GNU `L` output on create (names that cannot be prefix-split), plus
-  symlink/hardlink records behind an explicit opt-in.
+- Symlink and hardlink TAR records behind an explicit opt-in (creating and
+  extracting links is a security decision, not just a format one).
 - Full permission restore: the read-only bit now round-trips, but complete
   POSIX modes (executable bits, group/other), ACLs and Windows hidden/system
   attributes are still not carried or applied.

@@ -56,7 +56,9 @@ ak_zip_append("backup.zip", "extra.log", "logs/extra.log");
   and TAR long names carried the two ways they really are: GNU `L` records
   and pax `x` extended headers (`path`, `size`, `mtime`). Metadata records
   are consumed as structure, never listed as entries. On create, TAR names
-  use the 100-byte field or a 155+100 byte ustar prefix split.
+  use the 100-byte field or a 155+100 byte ustar prefix split, and fall back
+  to a GNU long-name record when neither fits — so deep Windows paths no
+  longer fail to archive.
 - **Bounded, and honest about it.** 256 MiB encoded input, 64 MiB per
   expanded entry, 512 MiB total declared output, 10,000 entries — the same
   budgets are enforced while *creating*, so an archive can never be written
@@ -67,7 +69,7 @@ ak_zip_append("backup.zip", "extra.log", "logs/extra.log");
 
 ## Verification status
 
-- 41 tests: 37 unit tests plus 4 integration tests. CRC vectors;
+- 43 tests: 38 unit tests plus 5 integration tests. CRC vectors;
   zlib-produced DEFLATE streams (embedded, byte-exact); deflate↔inflate
   roundtrips including incompressible data, window-edge data, block
   boundaries and multi-block streams; Huffman length limiting and

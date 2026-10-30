@@ -78,6 +78,21 @@ silently rather than aborting the call, while an unsafe entry *inside* the
 selection aborts with `AK_ERR_CORRUPT`. An unsafe prefix itself is
 `AK_ERR_INVALID_ARG`, not a silent no-op that reports zero files.
 
+**GNU long-name output.** TAR creation no longer refuses names that cannot be
+prefix-split: it emits a GNU `L` record (a header named `././@LongLink`) whose
+data is the NUL-terminated name, followed by the entry's own header carrying a
+truncated placeholder. Three bounds apply. The record is capped at 64 KiB,
+exactly the limit the *reader* applies to metadata records, so this library can
+always reopen what it writes. The placeholder is truncated on a UTF-8 character
+boundary, so a reader that ignores the record still sees valid text rather than
+a mangled sequence. And a name is only ever routed to a long record when no
+ustar prefix split exists, so ordinary archives stay plain ustar and strict
+readers keep working. Verified against GNU tar (`-t`, `-x`), Python tarfile and
+this library's own reader on a 306-byte name. The pax and GNU metadata parsers
+now also have a bounded adversarial corpus (`tar_metadata_record_parsers_never_panic`)
+covering truncated records, unparseable sizes, zero lengths and random
+payloads; that is regression coverage, not a fuzzing campaign.
+
 **Timestamp restoration.** Extraction now calls `utimensat` (Unix) or
 `SetFileTime` (Windows) with the time each entry declared. The value is
 validated before use: the Windows path converts to 100 ns ticks in `i128` and

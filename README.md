@@ -43,6 +43,10 @@ ak_zip_append("backup.zip", "extra.log", "logs/extra.log");
   re-applied on extract. Both use the same ordering rule, directories last,
   so writing children cannot undo a parent's time and a read-only directory
   can still be populated before it is locked.
+- **Tarballs with symlinks extract instead of failing.** Link and special-file
+  entries are listed with their `type`, and extraction skips them and says so
+  through `ak_last_warning()` — Windows cannot recreate them anyway, and one
+  link used to abort the whole extraction of an otherwise ordinary archive.
 - **Traversal-safe by construction.** Every extraction path is joined
   through a guard that refuses absolute paths, drive-relative names, and
   `..` escapes — archives are untrusted input.
@@ -70,7 +74,7 @@ ak_zip_append("backup.zip", "extra.log", "logs/extra.log");
 
 ## Verification status
 
-- 45 tests: 40 unit tests plus 5 integration tests. CRC vectors;
+- 46 tests: 41 unit tests plus 5 integration tests. CRC vectors;
   zlib-produced DEFLATE streams (embedded, byte-exact); deflate↔inflate
   roundtrips including incompressible data, window-edge data, block
   boundaries and multi-block streams; Huffman length limiting and

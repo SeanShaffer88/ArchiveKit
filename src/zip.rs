@@ -202,6 +202,11 @@ pub fn list(bytes: &[u8]) -> AResult<Vec<ZipEntry>> {
                 is_dir,
                 crc32: Some(crc),
                 modified_unix: Some(dos_to_unix(mtime, mdate)),
+                kind: if is_dir {
+                    crate::EntryKind::Dir
+                } else {
+                    crate::EntryKind::File
+                },
                 read_only: decode_read_only(version_made_by, external_attributes),
             },
             method_id: method,

@@ -78,6 +78,20 @@ silently rather than aborting the call, while an unsafe entry *inside* the
 selection aborts with `AK_ERR_CORRUPT`. An unsafe prefix itself is
 `AK_ERR_INVALID_ARG`, not a silent no-op that reports zero files.
 
+**Link and special-file entries.** Extraction used to abort the moment it met a
+TAR entry that was not a regular file or directory, so any tarball containing a
+symlink — most Linux ones — failed entirely. Those entries are now skipped and
+counted in `ak_last_warning()`, and `ak_list_json` reports the kind
+(`symlink`, `hardlink`, `other`) so a caller can see what a listing contains
+before extracting. This is also the conservative choice for safety: a
+symlink-writing extractor is how many archive escapes happen, and skipping
+cannot create a link at all, so the traversal guard's job is unchanged and
+narrower in scope. The user-visible cost is that a "successful" extraction can
+be incomplete, which is why the warning is part of the contract rather than a
+debug aid: callers that care about completeness must read it. Asking for such
+an entry by name remains a hard `AK_ERR_NOT_SUPPORTED` error, and `ak_test`
+still verifies the archive as a whole.
+
 **Duplicate and colliding entries.** Extraction now records every file path it
 writes and refuses a second entry that resolves to the same path, reporting both
 entry names as `AK_ERR_CORRUPT`. Two consequences worth stating. First, this is

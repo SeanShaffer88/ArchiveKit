@@ -21,6 +21,20 @@ use crate::{
 thread_local! {
     static LAST_ERROR: RefCell<(i32, CString)> =
         RefCell::new((AK_OK, CString::new("").unwrap()));
+    /// Non-fatal note about the most recent call: what was skipped and why.
+    /// Empty when the last call completed without omitting anything.
+    static LAST_WARNING: RefCell<CString> = RefCell::new(CString::new("").unwrap());
+}
+
+fn set_warning(message: &str) {
+    LAST_WARNING.with(|slot| {
+        *slot.borrow_mut() =
+            CString::new(message).unwrap_or_else(|_| CString::new("warning").unwrap());
+    });
+}
+
+fn clear_warning() {
+    set_warning("");
 }
 
 fn set_error(code: i32, msg: &str) {
@@ -181,6 +195,28 @@ fn write_extracted(target: &Path, data: &[u8], mtime: Option<i64>) -> AResult<()
     Ok(())
 }
 
+/// Human-readable note about entries extraction could not write. Lists a few
+/// names so a caller can act on it without re-listing the archive.
+fn skip_message(skipped: &[&str]) -> String {
+    const SHOWN: usize = 5;
+    let names: Vec<&str> = skipped.iter().take(SHOWN).copied().collect();
+    let mut message = format!(
+        "{} entr{} skipped (not a regular file or directory, e.g. symbolic or \
+         hard links): {}",
+        skipped.len(),
+        if skipped.len() == 1 {
+            "y was"
+        } else {
+            "ies were"
+        },
+        names.join(", ")
+    );
+    if skipped.len() > SHOWN {
+        message.push_str(&format!(" and {} more", skipped.len() - SHOWN));
+    }
+    message
+}
+
 /// Key used to spot two archive entries that would land on the same file.
 /// Windows paths are case-insensitive, so there the key is folded; on Unix
 /// the same archive is legal and both files are written.
@@ -336,6 +372,7 @@ fn extract_prefix(bytes: &[u8], listed: &Listed, dest: &Path, prefix: &str) -> A
     let mut directory_attributes: Vec<std::path::PathBuf> = Vec::new();
     let mut seen_files: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    let mut skipped: Vec<&str> = Vec::new();
     for index in 0..listed.len() {
         let meta = listed.meta_at(index);
         let slashed;
@@ -380,6 +417,10 @@ fn extract_prefix(bytes: &[u8], listed: &Listed, dest: &Path, prefix: &str) -> A
             }
             continue;
         }
+        if !meta.kind.is_extractable() {
+            skipped.push(meta.name.as_str());
+            continue;
+        }
         // Two entries writing one path is the archive's fault, not the
         // destination's, and the "existing file" error would blame the
         // wrong thing. Say which two entries collide instead (this also
@@ -404,6 +445,9 @@ fn extract_prefix(bytes: &[u8], listed: &Listed, dest: &Path, prefix: &str) -> A
     for path in directory_attributes.into_iter().rev() {
         apply_read_only(&path, true);
     }
+    if !skipped.is_empty() {
+        set_warning(&skip_message(&skipped));
+    }
     Ok(count)
 }
 
@@ -413,6 +457,7 @@ fn extract_all(bytes: &[u8], listed: &Listed, dest: &Path) -> AResult<u64> {
     let mut directory_attributes: Vec<std::path::PathBuf> = Vec::new();
     let mut seen_files: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    let mut skipped: Vec<&str> = Vec::new();
     for index in 0..listed.len() {
         let meta = listed.meta_at(index);
         let clean = strip_dot_slash(&meta.name);
@@ -440,6 +485,10 @@ fn extract_all(bytes: &[u8], listed: &Listed, dest: &Path) -> AResult<u64> {
             }
             continue;
         }
+        if !meta.kind.is_extractable() {
+            skipped.push(meta.name.as_str());
+            continue;
+        }
         // Two entries writing one path is the archive's fault, not the
         // destination's, and the "existing file" error would blame the
         // wrong thing. Say which two entries collide instead (this also
@@ -463,6 +512,9 @@ fn extract_all(bytes: &[u8], listed: &Listed, dest: &Path) -> AResult<u64> {
     apply_directory_times(directory_times);
     for path in directory_attributes.into_iter().rev() {
         apply_read_only(&path, true);
+    }
+    if !skipped.is_empty() {
+        set_warning(&skip_message(&skipped));
     }
     Ok(count)
 }
@@ -499,6 +551,15 @@ pub extern "C" fn ak_last_error() -> *const c_char {
     LAST_ERROR.with(|e| e.borrow().1.as_ptr())
 }
 
+/// Non-fatal note about the previous call, or an empty string. Today this
+/// reports entries that were skipped during extraction because they are not
+/// regular files or directories (symbolic links, hard links, special files).
+/// Never NULL; do not free.
+#[no_mangle]
+pub extern "C" fn ak_last_warning() -> *const c_char {
+    LAST_WARNING.with(|w| w.borrow().as_ptr())
+}
+
 #[no_mangle]
 pub extern "C" fn ak_last_error_code() -> c_int {
     LAST_ERROR.with(|e| e.borrow().0) as c_int
@@ -525,6 +586,7 @@ pub extern "C" fn ak_free_string(p: *mut c_char) {
 #[no_mangle]
 pub extern "C" fn ak_list_json(archive_utf8: *const c_char) -> *mut c_char {
     let run = guard(|| {
+        clear_warning();
         let path = require_str(archive_utf8, "archive")?;
         let (_, _, listed) = read_archive(&path)?;
         Ok(list_json(&listed.metas()))
@@ -546,6 +608,7 @@ pub extern "C" fn ak_list_json(archive_utf8: *const c_char) -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn ak_test(archive_utf8: *const c_char) -> i64 {
     let run = guard(|| {
+        clear_warning();
         let path = require_str(archive_utf8, "archive")?;
         let (bytes, fmt, _) = read_archive(&path)?;
         let n = match fmt {
@@ -577,6 +640,7 @@ pub extern "C" fn ak_extract(
     entry_utf8: *const c_char,
 ) -> i64 {
     let run = guard(|| {
+        clear_warning();
         let path = require_str(archive_utf8, "archive")?;
         let dest = require_str(dest_dir_utf8, "dest_dir")?;
         let (bytes, _, listed) = read_archive(&path)?;
@@ -626,6 +690,7 @@ pub extern "C" fn ak_extract_prefix(
     prefix_utf8: *const c_char,
 ) -> i64 {
     let run = guard(|| {
+        clear_warning();
         let path = require_str(archive_utf8, "archive")?;
         let dest = require_str(dest_dir_utf8, "dest_dir")?;
         let prefix = require_str(prefix_utf8, "prefix")?;
@@ -715,6 +780,7 @@ fn create_impl(archive: &str, root: &str, fmt: Format) -> AResult<i64> {
 #[no_mangle]
 pub extern "C" fn ak_create_zip(archive_utf8: *const c_char, root_dir_utf8: *const c_char) -> i64 {
     let run = guard(|| {
+        clear_warning();
         let archive = require_str(archive_utf8, "archive")?;
         let root = require_str(root_dir_utf8, "root_dir")?;
         create_impl(&archive, &root, Format::Zip)
@@ -736,6 +802,7 @@ pub extern "C" fn ak_create_zip(archive_utf8: *const c_char, root_dir_utf8: *con
 #[no_mangle]
 pub extern "C" fn ak_create_tar(archive_utf8: *const c_char, root_dir_utf8: *const c_char) -> i64 {
     let run = guard(|| {
+        clear_warning();
         let archive = require_str(archive_utf8, "archive")?;
         let root = require_str(root_dir_utf8, "root_dir")?;
         create_impl(&archive, &root, Format::Tar)
@@ -762,6 +829,7 @@ pub extern "C" fn ak_zip_append(
     arcname_utf8: *const c_char,
 ) -> c_int {
     let run = guard(|| {
+        clear_warning();
         let archive = require_str(archive_utf8, "archive")?;
         let file = require_str(file_utf8, "file")?;
         let arcname = require_str(arcname_utf8, "arcname")?;
@@ -1422,6 +1490,137 @@ mod tests {
             assert_eq!(fs::read(dest3.join("Case.txt")).unwrap(), b"upper");
             assert_eq!(fs::read(dest3.join("case.txt")).unwrap(), b"lower");
         }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Turn one header of a normal archive into a foreign one (links),
+    /// recomputing the checksum exactly as tar does.
+    fn patch_typeflag(block: &mut [u8; 512], typeflag: u8) {
+        block[156] = typeflag;
+        // Link headers carry no data, so the size field must be zeroed or the
+        // reader will consume the following header as data blocks.
+        block[124..136].fill(0);
+        block[148..156].fill(b' ');
+        let sum: u64 = block.iter().map(|&b| u64::from(b)).sum();
+        let checksum = format!("{sum:06o}\0 ");
+        block[148..156].copy_from_slice(checksum.as_bytes());
+    }
+
+    /// A header that reuses the seed's fields but renames the entry and sets a
+    /// foreign typeflag. Link entries carry no data, hence the cleared size.
+    fn link_header(seed: &[u8], name: &str, typeflag: u8) -> [u8; 512] {
+        let mut block = [0u8; 512];
+        block.copy_from_slice(&seed[..512]);
+        block[..name.len()].copy_from_slice(name.as_bytes());
+        block[name.len()] = 0;
+        patch_typeflag(&mut block, typeflag);
+        block
+    }
+
+    #[test]
+    fn ffi_link_entries_are_skipped_and_reported() {
+        // Most real tarballs contain a symlink; extraction must not abort on
+        // one, but must not pretend it happened either.
+        let base = std::env::temp_dir().join(format!("ak-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let tar_path = base.join("links.tar");
+        let seed = tar::create(&[NewTarEntry {
+            name: "real.txt".into(),
+            data: b"hello".to_vec(),
+            modified_unix: 1_792_674_000,
+            is_dir: false,
+            read_only: false,
+        }])
+        .unwrap();
+        // create() ends the archive with two zero blocks, and the reader stops
+        // there, so the link headers go before them.
+        let mut archive = seed[..seed.len() - 1024].to_vec();
+        archive.extend_from_slice(&link_header(&seed, "link0.txt", b'2'));
+        archive.extend_from_slice(&link_header(&seed, "link1.txt", b'1'));
+        archive.extend_from_slice(&[0u8; 1024]);
+        fs::write(&tar_path, &archive).unwrap();
+        let archive_c = cstr(tar_path.to_str().unwrap());
+
+        // The listing says what is there.
+        let list_ptr = ak_list_json(archive_c.as_ptr());
+        assert!(!list_ptr.is_null());
+        // SAFETY: pointer came from this module in this test.
+        let json = unsafe { CStr::from_ptr(list_ptr) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        ak_free_string(list_ptr);
+        assert!(json.contains(r#""type":"symlink""#), "{json}");
+        assert!(json.contains(r#""type":"hardlink""#), "{json}");
+        assert!(json.contains(r#""type":"file""#), "{json}");
+
+        // Extraction writes what it can and reports the rest.
+        let dest = base.join("out");
+        assert_eq!(
+            ak_extract(
+                archive_c.as_ptr(),
+                cstr(dest.to_str().unwrap()).as_ptr(),
+                std::ptr::null()
+            ),
+            1
+        );
+        assert_eq!(fs::read(dest.join("real.txt")).unwrap(), b"hello");
+        assert!(!dest.join("link0.txt").exists());
+        // SAFETY: thread-local C string owned by this module.
+        let warning = unsafe { CStr::from_ptr(ak_last_warning()) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(warning.contains("2 entries were skipped"), "{warning}");
+        assert!(warning.contains("link0.txt"), "{warning}");
+        // A successful call without skips clears it.
+        let plain = base.join("plain.tar");
+        fs::write(
+            &plain,
+            tar::create(&[NewTarEntry {
+                name: "a.txt".into(),
+                data: b"a".to_vec(),
+                modified_unix: 0,
+                is_dir: false,
+                read_only: false,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+        let plain_dest = base.join("plain-out");
+        assert_eq!(
+            ak_extract(
+                cstr(plain.to_str().unwrap()).as_ptr(),
+                cstr(plain_dest.to_str().unwrap()).as_ptr(),
+                std::ptr::null()
+            ),
+            1
+        );
+        // SAFETY: thread-local C string owned by this module.
+        // SAFETY: thread-local C string owned by this module.
+        assert!(unsafe { CStr::from_ptr(ak_last_warning()) }
+            .to_bytes()
+            .is_empty());
+
+        // Asking for a link by name is an explicit error, not a silent zero.
+        assert_eq!(
+            ak_extract(
+                archive_c.as_ptr(),
+                cstr(dest.to_str().unwrap()).as_ptr(),
+                cstr("link0.txt").as_ptr()
+            ),
+            -1
+        );
+        assert_eq!(ak_last_error_code(), c_int::from(crate::ERR_NOT_SUPPORTED));
+        // SAFETY: thread-local C string owned by this module.
+        let message = unsafe { CStr::from_ptr(ak_last_error()) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(message.contains("symbolic link"), "{message}");
+        // The whole archive still verifies, links included.
+        assert_eq!(ak_test(archive_c.as_ptr()), 3);
         let _ = fs::remove_dir_all(&base);
     }
 

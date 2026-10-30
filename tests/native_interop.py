@@ -36,6 +36,7 @@ lib.ak_list_json.restype = ctypes.c_void_p
 lib.ak_list_json.argtypes = [ctypes.c_char_p]
 lib.ak_free_string.argtypes = [ctypes.c_void_p]
 lib.ak_last_error.restype = ctypes.c_char_p
+lib.ak_last_warning.restype = ctypes.c_char_p
 lib.ak_last_error_code.restype = ctypes.c_int
 
 
@@ -335,6 +336,44 @@ with tempfile.TemporaryDirectory(prefix="archivekit-interop-") as folder:
         if path.exists():
             path.chmod(0o666)
 
+    # ---- tarballs with links extract instead of failing --------------------
+    # Most Linux tarballs contain a symlink; failing the whole extraction on
+    # one made the library useless for them. The archive is built from headers
+    # rather than from real links: Windows runners may refuse to create a
+    # symlink without a privilege, and the point here is the reader.
+    link_arc = root / "links.tar"
+    with tarfile.open(link_arc, "w") as t:
+        payload = b"real content"
+        info = tarfile.TarInfo("real.txt")
+        info.size = len(payload)
+        info.mtime = 1_792_674_000
+        t.addfile(info, io.BytesIO(payload))
+        sym = tarfile.TarInfo("sym.txt")
+        sym.type = tarfile.SYMTYPE
+        sym.linkname = "real.txt"
+        t.addfile(sym)
+        hard = tarfile.TarInfo("hard.txt")
+        hard.type = tarfile.LNKTYPE
+        hard.linkname = "real.txt"
+        t.addfile(hard)
+    entries, _ = listing(link_arc)
+    kinds = {e["name"]: e["type"] for e in entries}
+    assert kinds == {"real.txt": "file", "sym.txt": "symlink", "hard.txt": "hardlink"}, kinds
+    assert test(link_arc) == 3
+    dest = root / "links-out"
+    assert extract(link_arc, dest) == 1
+    assert (dest / "real.txt").read_bytes() == b"real content"
+    warning = lib.ak_last_warning().decode()
+    assert "2 entries were skipped" in warning, warning
+    assert not (dest / "sym.txt").exists() and not (dest / "hard.txt").exists()
+    # A later call that skips nothing clears the warning.
+    assert extract(link_arc, root / "links-out2", "real.txt") == 1
+    assert lib.ak_last_warning().decode() == ""
+    # Asking for the link by name is an explicit error with the link type.
+    assert extract(link_arc, dest, "sym.txt") == -1
+    assert lib.ak_last_error_code() == 2  # AK_ERR_NOT_SUPPORTED
+    assert b"symbolic link" in lib.ak_last_error()
+
     # ---- directories marked only by the DOS attribute ----------------------
     attrs_zip = root / "attrs.zip"
     attrs_zip.write_bytes(one_entry_zip(b"folder", b"", 0, attributes=0x10))
@@ -365,6 +404,6 @@ print(
     "Native interop passed: Python ZIP store/deflate, streaming and legacy "
     "CP437 archives and GNU/pax TAR -> DLL; DLL ZIP (dynamic Huffman) and "
     "TAR (prefix split, GNU long names) -> Python; folder extraction, "
-    "timestamp and read-only restoration, ZIP64 and traversal refusals "
-    "verified"
+    "timestamp and read-only restoration, link skipping, ZIP64 and "
+    "traversal refusals verified"
 )

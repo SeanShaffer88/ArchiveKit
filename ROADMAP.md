@@ -47,8 +47,10 @@ extraction.
 **v0.3**
 - ZIP64 *read* support for large archives, and `data-descriptor` archives
   whose sizes only appear in the trailing descriptor.
-- Symlink and hardlink TAR records behind an explicit opt-in (creating and
-  extracting links is a security decision, not just a format one).
+- Symlink and hardlink *creation* behind an explicit opt-in (creating links
+  is a security decision, not just a format one). Reading already lists them
+  with their `type`, and extraction skips them and reports the count through
+  `ak_last_warning()`.
 - Full permission restore: the read-only bit now round-trips, but complete
   POSIX modes (executable bits, group/other), ACLs and Windows hidden/system
   attributes are still not carried or applied.

@@ -217,6 +217,16 @@ pub fn list(bytes: &[u8]) -> AResult<Vec<TarEntry>> {
                 is_dir,
                 crc32: None,
                 modified_unix: Some(mtime),
+                kind: if is_dir {
+                    crate::EntryKind::Dir
+                } else {
+                    match typeflag {
+                        b'0' | 0 => crate::EntryKind::File,
+                        b'1' => crate::EntryKind::Hardlink,
+                        b'2' => crate::EntryKind::Symlink,
+                        _ => crate::EntryKind::Other,
+                    }
+                },
                 // A zero mode means "not recorded"; only a real mode with no
                 // write bit at all counts as read-only.
                 read_only: mode != 0 && mode & 0o200 == 0,
@@ -240,10 +250,22 @@ pub fn read_entry(bytes: &[u8], entry: &TarEntry) -> AResult<Vec<u8>> {
         b'0' | 0 => {}
         b'5' => return Ok(Vec::new()),
         other => {
+            let what = match other {
+                b'1' => "a hard link",
+                b'2' => "a symbolic link",
+                b'3' | b'4' => "a device node",
+                b'6' => "a FIFO",
+                _ => "a special file",
+            };
             return err(
                 ERR_NOT_SUPPORTED,
-                format!("tar entry type '{}' is not supported", other as char),
-            )
+                format!(
+                    "entry '{}' is {what}; ArchiveKit writes regular files and \
+                     directories (extracting the whole archive skips these and \
+                     reports them through ak_last_warning)",
+                    entry.meta.name
+                ),
+            );
         }
     }
     if entry.meta.size > crate::MAX_ENTRY_BYTES as u64 {

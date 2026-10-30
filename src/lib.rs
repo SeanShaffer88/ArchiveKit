@@ -110,6 +110,35 @@ pub fn detect_format(bytes: &[u8], path_hint: &str) -> AResult<Format> {
     }
 }
 
+/// What an archive entry actually is. ZIP only distinguishes files and
+/// directories; TAR also carries links and special files, which Windows
+/// cannot recreate without privilege and which extraction therefore skips.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EntryKind {
+    File,
+    Dir,
+    Symlink,
+    Hardlink,
+    Other,
+}
+
+impl EntryKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            EntryKind::File => "file",
+            EntryKind::Dir => "dir",
+            EntryKind::Symlink => "symlink",
+            EntryKind::Hardlink => "hardlink",
+            EntryKind::Other => "other",
+        }
+    }
+
+    /// Only these two are written back to disk.
+    pub fn is_extractable(&self) -> bool {
+        matches!(self, EntryKind::File | EntryKind::Dir)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntryMeta {
     pub name: String,
@@ -120,6 +149,8 @@ pub struct EntryMeta {
     pub is_dir: bool,
     pub crc32: Option<u32>,
     pub modified_unix: Option<i64>,
+    /// File, directory, link or special file.
+    pub kind: EntryKind,
     /// The entry is marked read-only. ZIP carries this as the DOS read-only
     /// attribute (or a Unix mode without a write bit), TAR as a mode without
     /// a write bit. Extraction re-applies it; nothing else is preserved.
@@ -137,7 +168,7 @@ impl EntryMeta {
             None => "null".to_string(),
         };
         format!(
-            "{{\"name\":\"{}\",\"size\":{},\"compressed_size\":{},\"method\":\"{}\",\"is_dir\":{},\"crc32\":{},\"modified_unix\":{},\"read_only\":{}}}",
+            "{{\"name\":\"{}\",\"size\":{},\"compressed_size\":{},\"method\":\"{}\",\"is_dir\":{},\"crc32\":{},\"modified_unix\":{},\"read_only\":{},\"type\":\"{}\"}}",
             json_escape(&self.name),
             self.size,
             self.compressed_size,
@@ -145,7 +176,8 @@ impl EntryMeta {
             self.is_dir,
             crc,
             mtime,
-            self.read_only
+            self.read_only,
+            self.kind.name()
         )
     }
 }

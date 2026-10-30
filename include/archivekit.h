@@ -65,18 +65,25 @@ AK_API uint32_t ak_version_minor(void);
 AK_API uint32_t ak_version_patch(void);
 AK_API const char *ak_last_error(void);       /* thread-local; do NOT free */
 AK_API int ak_last_error_code(void);
+/* Non-fatal note about the previous call ("" when nothing was omitted),
+ * e.g. entries skipped during extraction. Thread-local; do NOT free. */
+AK_API const char *ak_last_warning(void);
 AK_API void ak_free_string(char *p);          /* frees ak_list_json results */
 
 /* Read --------------------------------------------------------------------- */
 /* JSON array: [{"name":"...","size":N,"compressed_size":N,"method":"deflate",
  * "is_dir":false,"crc32":"0d4a1185" (or null),"modified_unix":N (or null),
- * "read_only":false}]
- * Format is detected from content, falling back to the file extension. */
+ * "read_only":false,"type":"file"}]
+ * "type" is file, dir, symlink, hardlink or other. Format is detected from
+ * content, falling back to the file extension. */
 AK_API char *ak_list_json(const char *archive_utf8);
 /* Verify structure + full decompression + CRC (ZIP). Returns entry count. */
 AK_API int64_t ak_test(const char *archive_utf8);
 /* Extract all (entry_utf8 == NULL) or one named entry into dest_dir.
- * Returns the number of FILES written. */
+ * Returns the number of FILES written. Entries that are not regular files
+ * or directories (TAR symlinks, hard links, device nodes) are skipped and
+ * counted in ak_last_warning() rather than failing the extraction; asking
+ * for one by name is still an error. */
 AK_API int64_t ak_extract(const char *archive_utf8, const char *dest_dir_utf8,
                           const char *entry_utf8);
 /* Extract one folder and everything below it. prefix_utf8 is matched on

@@ -16,6 +16,9 @@
  * -------------------
  * - ZIP: STORE + DEFLATE. No encryption, no ZIP64, no multi-disk;
  *   archives needing them fail with AK_ERR_NOT_SUPPORTED.
+ * - Names: UTF-8 when the entry's UTF-8 flag is set (or the bytes are
+ *   valid UTF-8); otherwise legacy CP437, which is what APPNOTE 4.4.4
+ *   assigns to unflagged names.
  * - TAR: ustar, files + directories. On create, names use the 100-byte
  *   name field or a 155+100 byte prefix split; longer names are refused.
  *   On read, GNU 'L' long names and pax 'x' path/size/mtime records are
@@ -70,6 +73,13 @@ AK_API int64_t ak_test(const char *archive_utf8);
  * Returns the number of FILES written. */
 AK_API int64_t ak_extract(const char *archive_utf8, const char *dest_dir_utf8,
                           const char *entry_utf8);
+/* Extract one folder and everything below it. prefix_utf8 is matched on
+ * path component boundaries ("doc" does not select "docs/x") and the
+ * prefix itself is stripped from the written paths, so the folder's
+ * contents land directly in dest_dir. An empty prefix extracts all.
+ * Returns the number of FILES written, or -1 on error. */
+AK_API int64_t ak_extract_prefix(const char *archive_utf8, const char *dest_dir_utf8,
+                                 const char *prefix_utf8);
 
 /* Create --------------------------------------------------------------------- */
 /* Archive the contents of root_dir. Returns the entry count. */

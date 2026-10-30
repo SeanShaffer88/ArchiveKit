@@ -64,6 +64,20 @@ model whose streams were decoded by zlib: 300 structural fuzz cases, 4,000
 random frequency sets (no incomplete or over-long codes), and byte-exact
 anchors now asserted in the Rust test suite.
 
+**Name decoding and folder extraction (added to v0.2 before release).** ZIP
+names are now decoded as UTF-8 when the entry sets the UTF-8 flag or when the
+bytes are valid UTF-8, and as CP437 otherwise (APPNOTE 4.4.4). This cannot
+widen the extraction surface: ASCII bytes pass through unchanged and every
+CP437 high byte maps to a non-ASCII printable character (U+00A1 and above),
+so decoding cannot introduce a `/` or `\` separator, a drive colon, a control
+character or a device name. The traversal guard therefore still sees exactly
+the separator set it did before. `ak_extract_prefix` selects entries on
+component boundaries and strips the prefix; it traversal-checks only the
+entries it writes, so an unsafe entry elsewhere in the archive is skipped
+silently rather than aborting the call, while an unsafe entry *inside* the
+selection aborts with `AK_ERR_CORRUPT`. An unsafe prefix itself is
+`AK_ERR_INVALID_ARG`, not a silent no-op that reports zero files.
+
 **What is still not proven.** No new Windows-native adversarial run was made
 for this change; Windows CI (fmt, clippy, test, release build, then
 `tests/native_interop.py` against the built DLL) is the native gate, and the

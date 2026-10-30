@@ -247,6 +247,90 @@ fn strip_dot_slash(name: &str) -> &str {
     n
 }
 
+/// Match `name` against a folder `prefix` on component boundaries, so
+/// "doc" never selects "docs/x". Returns the name's path *below* the
+/// prefix ("" for the prefix entry itself).
+fn strip_prefix_component<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
+    let rest = name.strip_prefix(prefix)?;
+    if rest.is_empty() {
+        return Some("");
+    }
+    rest.strip_prefix('/')
+}
+
+/// Normalize a folder prefix for matching: `\` separators become `/`, `./`
+/// segments and any trailing `/` are removed.
+fn normalize_prefix(prefix: &str) -> String {
+    let slashed = prefix.replace('\\', "/");
+    strip_dot_slash(&slashed).trim_end_matches('/').to_string()
+}
+
+/// Extract the folder `prefix` and everything below it. The prefix itself
+/// is stripped from the written paths, so `docs/api` lands its contents
+/// directly in `dest` — the "extract this folder" behaviour archive tools
+/// offer. Only entries that are actually selected are traversal-checked:
+/// an unsafe entry elsewhere in the archive is never written and does not
+/// abort the operation.
+fn extract_prefix(bytes: &[u8], listed: &Listed, dest: &Path, prefix: &str) -> AResult<u64> {
+    let prefix = normalize_prefix(prefix);
+    if prefix.is_empty() {
+        return extract_all(bytes, listed, dest);
+    }
+    // Reuse the extraction guard to validate the prefix itself: absolute
+    // paths, drive-relative names, `..` and device names are all refused.
+    if safe_join(dest, &prefix).is_none() {
+        return crate::err(
+            ERR_INVALID_ARG,
+            format!("'{prefix}' is not a safe folder prefix"),
+        );
+    }
+    let basename = prefix.rsplit('/').next().unwrap_or(&prefix).to_string();
+    let mut count = 0u64;
+    for index in 0..listed.len() {
+        let meta = listed.meta_at(index);
+        let slashed;
+        let clean = if meta.name.contains('\\') {
+            slashed = meta.name.replace('\\', "/");
+            strip_dot_slash(&slashed)
+        } else {
+            strip_dot_slash(&meta.name)
+        };
+        let rest = match strip_prefix_component(clean, &prefix) {
+            Some(rest) => rest,
+            None => continue,
+        };
+        // The prefix entry itself: a directory contributes nothing, and a
+        // file named exactly like the prefix keeps its own basename.
+        let relative = if rest.is_empty() {
+            if meta.is_dir {
+                safe_directories(dest)?;
+                continue;
+            }
+            basename.as_str()
+        } else {
+            rest
+        };
+        if relative.is_empty() {
+            continue;
+        }
+        let target = safe_join(dest, relative).ok_or((
+            ERR_CORRUPT,
+            format!(
+                "entry '{}' would escape the destination; refused",
+                meta.name
+            ),
+        ))?;
+        if meta.is_dir {
+            safe_directories(&target)?;
+            continue;
+        }
+        let data = listed.read(bytes, index)?;
+        write_extracted(&target, &data)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 fn extract_all(bytes: &[u8], listed: &Listed, dest: &Path) -> AResult<u64> {
     let mut count = 0u64;
     for index in 0..listed.len() {
@@ -412,6 +496,34 @@ pub extern "C" fn ak_extract(
         let data = listed.read(&bytes, index)?;
         write_extracted(&target, &data)?;
         Ok(1)
+    });
+    match run {
+        Ok(n) => {
+            clear_error();
+            n as i64
+        }
+        Err((c, m)) => {
+            set_error(c, &m);
+            -1
+        }
+    }
+}
+
+/// Extract one folder and everything below it. `prefix_utf8` is matched on
+/// path component boundaries; the prefix itself is stripped from the
+/// written paths. Returns the number of FILES written, or -1 on error.
+#[no_mangle]
+pub extern "C" fn ak_extract_prefix(
+    archive_utf8: *const c_char,
+    dest_dir_utf8: *const c_char,
+    prefix_utf8: *const c_char,
+) -> i64 {
+    let run = guard(|| {
+        let path = require_str(archive_utf8, "archive")?;
+        let dest = require_str(dest_dir_utf8, "dest_dir")?;
+        let prefix = require_str(prefix_utf8, "prefix")?;
+        let (bytes, _, listed) = read_archive(&path)?;
+        extract_prefix(&bytes, &listed, Path::new(&dest), &prefix)
     });
     match run {
         Ok(n) => {
@@ -744,6 +856,140 @@ mod tests {
         assert_eq!(
             fs::read(dest.join(&dir).join(&file)).unwrap(),
             b"long tar payload"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ffi_extract_prefix_writes_the_folder_contents() {
+        let base = std::env::temp_dir().join(format!("ak-prefix-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let zip_path = base.join("p.zip");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            &zip_path,
+            zip::create(&[
+                NewEntry::dir("docs/api", 0),
+                NewEntry::file("docs/api/a.txt", b"a".to_vec(), 0),
+                NewEntry::file("docs/api/deep/b.txt", b"b".to_vec(), 0),
+                NewEntry::file("docs/other/c.txt", b"c".to_vec(), 0),
+                NewEntry::file("docsx/d.txt", b"d".to_vec(), 0),
+                NewEntry::file("top.txt", b"t".to_vec(), 0),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        let archive = cstr(zip_path.to_str().unwrap());
+
+        // Contents of the folder land directly in dest, prefix stripped.
+        let dest = base.join("api");
+        let dest_c = cstr(dest.to_str().unwrap());
+        assert_eq!(
+            ak_extract_prefix(archive.as_ptr(), dest_c.as_ptr(), cstr("docs/api").as_ptr()),
+            2
+        );
+        assert_eq!(fs::read(dest.join("a.txt")).unwrap(), b"a");
+        assert_eq!(fs::read(dest.join("deep").join("b.txt")).unwrap(), b"b");
+        assert!(!dest.join("api").exists());
+        assert!(!dest.join("other").exists());
+
+        // Trailing slash and `./` are tolerated.
+        let dest2 = base.join("trailing");
+        assert_eq!(
+            ak_extract_prefix(
+                archive.as_ptr(),
+                cstr(dest2.to_str().unwrap()).as_ptr(),
+                cstr("./docs/api/").as_ptr()
+            ),
+            2
+        );
+        // Matching is per component: "doc" or "docs/a" select nothing.
+        for miss in ["doc", "docs/a", "docs/api/deeper"] {
+            let dest3 = base.join(format!("miss-{}", miss.replace('/', "_")));
+            assert_eq!(
+                ak_extract_prefix(
+                    archive.as_ptr(),
+                    cstr(dest3.to_str().unwrap()).as_ptr(),
+                    cstr(miss).as_ptr()
+                ),
+                0,
+                "{miss}"
+            );
+        }
+        // A whole top-level folder: docs/api + docs/other + docsx are not
+        // included, because "docsx" is a different component.
+        let dest4 = base.join("docs");
+        assert_eq!(
+            ak_extract_prefix(
+                archive.as_ptr(),
+                cstr(dest4.to_str().unwrap()).as_ptr(),
+                cstr("docs").as_ptr()
+            ),
+            3
+        );
+        assert_eq!(fs::read(dest4.join("other").join("c.txt")).unwrap(), b"c");
+        assert!(!dest4.join("was-docsx").exists());
+        // Asking for a file extracts just that file, under its basename.
+        let dest5 = base.join("file");
+        assert_eq!(
+            ak_extract_prefix(
+                archive.as_ptr(),
+                cstr(dest5.to_str().unwrap()).as_ptr(),
+                cstr("docs/other/c.txt").as_ptr()
+            ),
+            1
+        );
+        assert_eq!(fs::read(dest5.join("c.txt")).unwrap(), b"c");
+        // Unsafe prefixes are refused rather than silently matching nothing.
+        for bad in ["..", "../docs", "C:/docs", "/docs"] {
+            assert_eq!(
+                ak_extract_prefix(archive.as_ptr(), dest_c.as_ptr(), cstr(bad).as_ptr()),
+                -1,
+                "{bad}"
+            );
+            assert_eq!(ak_last_error_code(), ERR_INVALID_ARG as c_int, "{bad}");
+        }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ffi_extract_prefix_ignores_unsafe_entries_outside_it() {
+        // A hostile entry elsewhere in the archive must not block extracting
+        // a clean folder, and must never be written.
+        let base = std::env::temp_dir().join(format!("ak-prefix-evil-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let zip_path = base.join("evil.zip");
+        fs::write(
+            &zip_path,
+            zip::create(&[
+                NewEntry::file("../escape.txt", b"nope".to_vec(), 0),
+                NewEntry::file("good/keep.txt", b"keep".to_vec(), 0),
+                NewEntry::file("good/deep/../traversal.txt", b"nope".to_vec(), 0),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        let dest = base.join("out");
+        let n = ak_extract_prefix(
+            cstr(zip_path.to_str().unwrap()).as_ptr(),
+            cstr(dest.to_str().unwrap()).as_ptr(),
+            cstr("good").as_ptr(),
+        );
+        // keep.txt is written; the traversal entry *inside* the prefix is
+        // refused, which aborts the operation with CORRUPT.
+        assert_eq!(n, -1);
+        assert_eq!(ak_last_error_code(), ERR_CORRUPT as c_int);
+        assert!(!base.join("escape.txt").exists());
+        assert!(!dest.join("traversal.txt").exists());
+        // Extracting everything still refuses the archive as a whole.
+        assert_eq!(
+            ak_extract(
+                cstr(zip_path.to_str().unwrap()).as_ptr(),
+                cstr(dest.to_str().unwrap()).as_ptr(),
+                std::ptr::null()
+            ),
+            -1
         );
         let _ = fs::remove_dir_all(&base);
     }

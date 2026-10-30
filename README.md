@@ -67,14 +67,17 @@ ak_zip_append("backup.zip", "extra.log", "logs/extra.log");
 
 ## Verification status
 
-- 33 tests: 29 unit tests plus 4 integration tests. CRC vectors;
+- 41 tests: 37 unit tests plus 4 integration tests. CRC vectors;
   zlib-produced DEFLATE streams (embedded, byte-exact); deflate↔inflate
   roundtrips including incompressible data, window-edge data, block
   boundaries and multi-block streams; Huffman length limiting and
   code-length RLE reconstruction; ZIP/TAR roundtrips; CRC corruption and
   truncation; ZIP64 marker refusal; TAR prefix splitting, GNU `L` and pax
-  record handling; traversal and device-name refusals; FFI
-  create→list→test→extract cycles including single-entry extraction.
+  record handling; legacy CP437 versus flagged-UTF-8 names; DOS-versus-Unix
+  read-only decoding; data-descriptor archives; traversal and device-name
+  refusals; timestamps and the read-only attribute restored on extraction;
+  FFI create→list→test→extract cycles including single-entry and
+  folder-prefix extraction.
 - The codec is verified three ways: zlib-produced vectors embedded in
   inflate tests, deflate↔inflate roundtrips, and live interop against
   system zip/unzip/tar and Python's zipfile/tarfile. The dynamic-Huffman

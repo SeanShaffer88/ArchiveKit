@@ -88,6 +88,22 @@ older. Restoration is best-effort - a TAR entry with no recorded time is left
 alone, and a failed attribute write never fails the extraction, because the
 content is already on disk.
 
+## Creating
+
+`ak_create_zip(archive, folder)` and `ak_create_tar(archive, folder)` archive
+every regular file and directory under `folder`, with each entry's modified
+time and read-only bit. Symlinks are **never followed** — a link can point
+outside the folder, so following one would archive whatever it happens to
+reach — and unreadable directories are skipped. Both cases are counted in
+`ak_last_warning()`, using the same wording as extraction:
+
+```c
+int64_t n = ak_create_zip("backup.zip", "C:\\Work");
+if (n >= 0 && ak_last_warning()[0]) {
+    printf("archived %lld entries; %s\n", n, ak_last_warning());
+}
+```
+
 ## Appending
 
 `ak_zip_append(archive, file, arcname)` adds one file to an existing ZIP,

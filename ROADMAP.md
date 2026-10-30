@@ -49,6 +49,10 @@ extraction.
   reported 1980. Other extra tags are still skipped.
 - Archives with a self-extractor stub in front (prepended bytes, short recorded
   offsets) are located from the EOCD instead of failing on the first record.
+- TAR v7 (pre-ustar) headers are read, recognised by their checksum, and
+  gzip/bzip2/xz/zstd/7z/RAR input is named as such instead of "unknown format".
+- GNU sparse members report `type: sparse` and are skipped with a warning
+  rather than extracted as stubs of the wrong contents.
 - Per-entry budget errors name the entry and its size instead of saying only
   that the archive exceeded a budget.
 

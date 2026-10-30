@@ -49,7 +49,7 @@ fn read_str(field: &[u8]) -> String {
     String::from_utf8_lossy(&field[..end]).into_owned()
 }
 
-fn header_checksum_ok(block: &[u8]) -> bool {
+pub(crate) fn header_checksum_ok(block: &[u8]) -> bool {
     if block.len() < 512 {
         return false;
     }
@@ -159,10 +159,16 @@ pub fn list(bytes: &[u8]) -> AResult<Vec<TarEntry>> {
                 format!("tar header checksum fails at offset {off}"),
             );
         }
-        if &block[257..262] != b"ustar" {
+        // ustar and its successors carry "ustar" at 257; the original v7
+        // format leaves those bytes zero. Both are tar, and the checksum
+        // above has already established this really is a header, so refusing
+        // v7 would only reject old backups this reader can parse fine.
+        let magic = &block[257..262];
+        let is_v7 = block[257..263].iter().all(|&b| b == 0);
+        if magic != b"ustar" && !is_v7 {
             return err(
                 ERR_CORRUPT,
-                format!("tar header at offset {off} is not ustar"),
+                format!("tar header at offset {off} is neither ustar nor v7"),
             );
         }
         let header_size = parse_octal(&block[124..136])?;
@@ -224,6 +230,7 @@ pub fn list(bytes: &[u8]) -> AResult<Vec<TarEntry>> {
                         b'0' | 0 => crate::EntryKind::File,
                         b'1' => crate::EntryKind::Hardlink,
                         b'2' => crate::EntryKind::Symlink,
+                        b'S' => crate::EntryKind::Sparse,
                         _ => crate::EntryKind::Other,
                     }
                 },
@@ -255,6 +262,7 @@ pub fn read_entry(bytes: &[u8], entry: &TarEntry) -> AResult<Vec<u8>> {
                 b'2' => "a symbolic link",
                 b'3' | b'4' => "a device node",
                 b'6' => "a FIFO",
+                b'S' => "a sparse file",
                 _ => "a special file",
             };
             return err(
@@ -470,6 +478,52 @@ mod tests {
             is_dir,
             read_only: false,
         }
+    }
+
+    #[test]
+    fn v7_headers_without_ustar_magic_are_read() {
+        // The original tar format has no magic at 257, so detection cannot
+        // rely on one; the checksum is what says "this is a header".
+        let mut archive = create(&[entry("v7.txt", b"v7 body", false)]).unwrap();
+        archive[257..263].fill(0);
+        archive[148..156].fill(b' ');
+        let sum: u64 = archive[..512].iter().map(|&b| b as u64).sum();
+        archive[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        // v7 writes a NUL typeflag for a regular file; ours writes '0'.
+        archive[156] = 0;
+        archive[148..156].fill(b' ');
+        let sum: u64 = archive[..512].iter().map(|&b| b as u64).sum();
+        archive[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+
+        let listed = list(&archive).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].meta.name, "v7.txt");
+        assert_eq!(listed[0].meta.kind, crate::EntryKind::File);
+        assert_eq!(read_entry(&archive, &listed[0]).unwrap(), b"v7 body");
+        assert_eq!(test(&archive).unwrap(), 1);
+        assert_eq!(
+            crate::detect_format(&archive, "noext").unwrap(),
+            crate::Format::Tar
+        );
+    }
+
+    #[test]
+    fn sparse_members_are_typed_rather_than_written_as_stubs() {
+        // A GNU sparse header describes only the data that is present, so
+        // writing it verbatim leaves a file of the right name and the wrong
+        // contents - worse than skipping it.
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&raw_header(b"db.bin", 3, b'S'));
+        archive.extend_from_slice(b"abc");
+        archive.resize(archive.len().next_multiple_of(512), 0);
+        archive.extend_from_slice(&[0u8; 1024]);
+        let listed = list(&archive).unwrap();
+        assert_eq!(listed[0].meta.kind, crate::EntryKind::Sparse);
+        assert!(!listed[0].meta.kind.is_extractable());
+        // Named explicitly it says what it is instead of quoting a typeflag.
+        let (code, message) = read_entry(&archive, &listed[0]).unwrap_err();
+        assert_eq!(code, crate::ERR_NOT_SUPPORTED);
+        assert!(message.contains("sparse file"), "{message}");
     }
 
     /// Build one ustar header the way a GNU/BSD tar would, so the reader can

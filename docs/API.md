@@ -32,6 +32,13 @@ wrote. The high half of CP437 is all non-ASCII printable characters, so this
 decoding cannot introduce a path separator, drive colon or device name — the
 traversal guard still sees exactly one place where separators can appear.
 
+## Timestamps
+
+| archive | resolution | restored |
+|---|---|---|
+| ZIP | 2 s, 1980-2107 | yes (zero clamps to 1980) |
+| TAR | 1 s | yes (zero = unknown, left alone) |
+
 ## Extracting a folder
 
 `ak_extract_prefix` selects an entry when its name is the prefix or starts
@@ -88,4 +95,11 @@ non-UTF-8 arguments). Details via `ak_last_error()` (thread-local).
   split. Longer names are refused — GNU `L` output is roadmap. Reading
   handles GNU `L` and pax `x` records, so those archives extract fine.
 - Timestamps: ZIP stores DOS time (2-second resolution, 1980-2107); TAR
-  stores whole seconds. Extraction does not restore them yet (roadmap).
+  stores whole seconds. Extraction restores the archive's modified time on
+  files and on listed directories (directories last, so writing children
+  cannot undo them). ZIP cannot express a time before 1980, so a zero ZIP
+  timestamp restores as 1980-01-01; a zero *TAR* timestamp is treated as
+  "unknown" and left alone. Restoration is best-effort: the content has
+  already been written, so a filesystem that rejects the timestamp does not
+  fail the extraction. File permissions and other attributes are not
+  restored.

@@ -78,6 +78,20 @@ silently rather than aborting the call, while an unsafe entry *inside* the
 selection aborts with `AK_ERR_CORRUPT`. An unsafe prefix itself is
 `AK_ERR_INVALID_ARG`, not a silent no-op that reports zero files.
 
+**Timestamp restoration.** Extraction now calls `utimensat` (Unix) or
+`SetFileTime` (Windows) with the time each entry declared. The value is
+validated before use: the Windows path converts to 100 ns ticks in `i128` and
+refuses anything outside the FILETIME range instead of wrapping, and the Unix
+path passes the seconds through unchanged. A zero TAR time is treated as
+unknown and skipped; ZIP clamps pre-1980 times to the DOS epoch because the
+format cannot express them. Restoration runs after the file handle is closed
+(Windows refuses attribute writes on an open write handle) and failures are
+deliberately swallowed, because the content is already on disk and a
+read-only volume or a filesystem without timestamps must not turn a good
+extraction into an error. This adds one more attribute write per entry, so an
+entry name that resolves to a path the process may write but not re-attribute
+now produces a file with the wrong (current) time rather than an error.
+
 **What is still not proven.** No new Windows-native adversarial run was made
 for this change; Windows CI (fmt, clippy, test, release build, then
 `tests/native_interop.py` against the built DLL) is the native gate, and the

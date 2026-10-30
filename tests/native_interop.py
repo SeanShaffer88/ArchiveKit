@@ -12,6 +12,7 @@ and GNU 'L' / pax 'x' long-name records are exercised in both directions.
 import ctypes
 import io
 import json
+import os
 import pathlib
 import struct
 import sys
@@ -245,6 +246,32 @@ with tempfile.TemporaryDirectory(prefix="archivekit-interop-") as folder:
     assert extract_prefix(tree, root / "bad", "../docs") == -1
     assert lib.ak_last_error_code() == 1  # AK_ERR_INVALID_ARG
 
+    # ---- restored timestamps, in both directions ---------------------------
+    stamped = root / "stamped.zip"
+    with zipfile.ZipFile(stamped, "w", zipfile.ZIP_DEFLATED) as z:
+        info = zipfile.ZipInfo("stamped.txt", date_time=(2026, 10, 20, 14, 20, 0))
+        z.writestr(info, b"hello")
+    dest = root / "stamped-out"
+    assert extract(stamped, dest) == 1
+    expected = 1792506000  # 2026-10-20T14:20:00Z
+    assert int((dest / "stamped.txt").stat().st_mtime) == expected, (
+        (dest / "stamped.txt").stat().st_mtime,
+        expected,
+    )
+    # TAR carries whole seconds; a directory's time must survive the children
+    # being written after it.
+    timed = root / "timed"
+    (timed / "sub").mkdir(parents=True)
+    (timed / "sub" / "f.txt").write_bytes(b"x" * 10)
+    for target in (timed / "sub" / "f.txt", timed / "sub"):
+        os.utime(target, (expected, expected))
+    arc = root / "timed.tar"
+    assert lib.ak_create_tar(str(arc).encode(), str(timed).encode()) == 2
+    dest = root / "timed-out"
+    assert extract(arc, dest) == 1  # one file; directories are not counted
+    assert int((dest / "sub" / "f.txt").stat().st_mtime) == expected
+    assert int((dest / "sub").stat().st_mtime) == expected
+
     # ---- traversal is refused and nothing lands outside the destination -----
     evil = root / "evil.zip"
     with zipfile.ZipFile(evil, "w") as z:
@@ -258,6 +285,6 @@ with tempfile.TemporaryDirectory(prefix="archivekit-interop-") as folder:
 print(
     "Native interop passed: Python ZIP store/deflate, streaming and legacy "
     "CP437 archives and GNU/pax TAR -> DLL; DLL ZIP (dynamic Huffman) and "
-    "TAR (prefix split) -> Python; folder extraction, ZIP64 and traversal "
-    "refusals verified"
+    "TAR (prefix split) -> Python; folder extraction, timestamp restoration, "
+    "ZIP64 and traversal refusals verified"
 )

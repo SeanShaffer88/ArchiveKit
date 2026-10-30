@@ -36,7 +36,7 @@ fn extraction_never_overwrites_and_refuses_junction_ancestors() {
     let zip_path = root.join("input.zip");
     fs::write(
         &zip_path,
-        zip::create(&[zip::NewEntry::file("keep.txt", b"new".to_vec(), 0)]),
+        zip::create(&[zip::NewEntry::file("keep.txt", b"new".to_vec(), 0)]).unwrap(),
     )
     .unwrap();
     fs::write(dest.join("keep.txt"), b"original").unwrap();
@@ -65,7 +65,8 @@ fn extraction_never_overwrites_and_refuses_junction_ancestors() {
                 "hop/escape.txt",
                 b"blocked".to_vec(),
                 0,
-            )]),
+            )])
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(

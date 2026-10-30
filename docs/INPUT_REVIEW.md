@@ -1,4 +1,9 @@
-# Input and extraction review — October 21–22, 2026
+# Input and extraction review
+
+This file records what the library refuses, why, and what is still not
+proven. Sections are dated; later sections describe later builds.
+
+## October 21–22, 2026 (v0.1 hardening)
 
 The C ABI is unchanged. New conservative refusals apply: 256 MiB encoded archive input, 64 MiB per expanded entry, 512 MiB total declared output and 10,000 entries. DEFLATE checks the budget before literal, stored-block and back-reference growth; ZIP uses the declared entry size as a tighter budget. TAR checks output size, padded offsets and input truncation before advancing.
 
@@ -6,6 +11,64 @@ Extraction creates new files exclusively and never overwrites existing files. De
 
 Limits: these metadata checks do not close adversarial replacement races. Use a fresh, quiescent extraction folder without untrusted concurrent writers. Extraction is not transactional: earlier files/directories can remain after failure; a failed write can leave a partial file named in the error. There is no cancellation API. Do not advertise this as a sandbox or as guaranteed containment against a hostile local filesystem actor. The archive-creation APIs are separate from these extraction safeguards.
 
-Validation on Windows 11 Home build 26300 x64: 19 Debug and 19 Release tests; host and all-target Windows Clippy/check; Release DLL build. Tests exercise intra-block expansion boundaries, malformed bounded corpora, traversal/device/ADS names, overwrite refusal and a real standard-user junction pointing to another synthetic folder. The outside fixture remained unchanged. Python stdlib ZIP store/deflate input decoded through the compiled DLL; ZIP and TAR created by the DLL were independently read by Python. Existing zlib vectors and round-trip anchors remain intact.
+Validation at that review, on Windows 11 Home build 26300 x64: 19 Debug and 19 Release tests (the suite has grown since); host and all-target Windows Clippy/check; Release DLL build. Tests exercised intra-block expansion boundaries, malformed bounded corpora, traversal/device/ADS names, overwrite refusal and a real standard-user junction pointing to another synthetic folder. The outside fixture remained unchanged. Python stdlib ZIP store/deflate input decoded through the compiled DLL; ZIP and TAR created by the DLL were independently read by Python. Existing zlib vectors and round-trip anchors remain intact.
 
 `tests/native_interop.py` is part of Windows CI. The deterministic malformed corpus is bounded regression coverage, not coverage-guided fuzzing, a sanitizer run or a complete security audit. Native ARM64 and hostile race/resource-exhaustion scenarios need separate evidence. Release panic strategy is unwind so the existing FFI panic guard works for unwinding panics; it cannot recover from invalid caller pointers or allocator/process aborts.
+
+## October 30, 2026 (v0.2)
+
+No ABI change: same functions, same error codes, same header.
+
+**New read paths, with their own bounds.** TAR now consumes GNU `L` long-name
+records and pax `x`/`X` extended headers instead of listing them as entries.
+A metadata record is capped at 64 KiB; GNU base-256 (binary) numeric fields
+are refused with `AK_ERR_NOT_SUPPORTED` rather than read as octal; pax records
+must declare a length that stays inside the record block and must be newline
+terminated, and `size`/`mtime` must parse, or the archive is `AK_ERR_CORRUPT`.
+A pax `size` override is used for both the reported entry size and the offset
+of the following header, so a placeholder header field cannot desynchronise the
+walk. Names from these records are subject to exactly the same extraction guard
+as before (`safe_join`), i.e. a long name is not a way around traversal checks.
+
+**ZIP64 is refused precisely.** The EOCD entry-count/offset/size overflow
+markers, and per-entry `0xFFFFFFFF` size or offset markers, now produce
+`AK_ERR_NOT_SUPPORTED` naming ZIP64. Previously such archives could be
+mis-parsed as corrupt or partially listed. ZIP64 *extra fields* whose central
+directory still carries classic sizes (what streaming writers emit) remain
+readable, because sizes are taken from the central directory.
+
+**Create paths now enforce the read budgets.** Entry count, per-file size and
+total size are checked while walking the folder, and the ZIP writer refuses
+more than 65,535 entries or a 4 GiB layout instead of writing a wrapped 16-bit
+count or 32-bit offset. This closes a silent-corruption hole rather than a
+security hole: the old writer produced an archive that described the wrong
+number of entries. Symlinks are still never followed; unreadable
+subdirectories are still skipped silently, which is a deliberate trade for
+backup use and is called out here.
+
+**Extraction changes.** The archive is parsed once per call instead of once
+per entry (v0.1 re-parsed the central directory for every file it extracted).
+A file that fails mid-write is removed instead of being left truncated, and
+the error says whether removal succeeded. The remaining non-transactional
+properties are unchanged: earlier entries stay on disk after a failure, and
+existing files are never overwritten.
+
+**What was verified for this change.** Locally on Linux x86_64, with rustc
+1.88.0: 29 unit tests and 4 integration tests, `cargo fmt --all -- --check`,
+`cargo clippy --all-targets -- -D warnings`, and the release cdylib. Interop
+was re-run against Info-ZIP `zip`/`unzip`, GNU `tar` (ustar, `gnu`, `pax`) and
+Python `zipfile`/`tarfile` in both directions, including long TAR names, a
+5-10 MB multi-block DEFLATE stream, ZIP64 refusal and traversal refusal. The
+dynamic-Huffman encoder was additionally checked against a line-by-line Python
+model whose streams were decoded by zlib: 300 structural fuzz cases, 4,000
+random frequency sets (no incomplete or over-long codes), and byte-exact
+anchors now asserted in the Rust test suite.
+
+**What is still not proven.** No new Windows-native adversarial run was made
+for this change; Windows CI (fmt, clippy, test, release build, then
+`tests/native_interop.py` against the built DLL) is the native gate, and the
+v0.1 statements above are neither re-run nor retracted. The TAR pax/GNU
+metadata parsers have not been fuzzed, only exercised against real archives
+and hand-built malformed records. Long TAR names beyond the ustar prefix split
+still cannot be *written*. Extraction remains a best-effort tool for
+trustworthy local archives, not a containment boundary.

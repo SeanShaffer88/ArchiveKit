@@ -12,11 +12,14 @@
  * - Count functions return the count, or -1 on error.
  * - ak_zip_append returns AK_OK (0) or an AK_ERR_* code.
  *
- * v0.1 scope (honest)
+ * v0.2 scope (honest)
  * -------------------
  * - ZIP: STORE + DEFLATE. No encryption, no ZIP64, no multi-disk;
  *   archives needing them fail with AK_ERR_NOT_SUPPORTED.
- * - TAR: ustar, files + directories; names up to 100 chars on create.
+ * - TAR: ustar, files + directories. On create, names use the 100-byte
+ *   name field or a 155+100 byte prefix split; longer names are refused.
+ *   On read, GNU 'L' long names and pax 'x' path/size/mtime records are
+ *   honoured (long link names are not).
  * - Extraction is traversal-safe: an entry that would land outside the
  *   destination directory aborts extraction with AK_ERR_CORRUPT.
  */

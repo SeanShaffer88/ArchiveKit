@@ -4,7 +4,10 @@
 //! CRC/size mismatches are ERR_CORRUPT.
 
 use crate::crc32::crc32;
-use crate::{dos_to_unix, err, unix_to_dos, AResult, EntryMeta, ERR_CORRUPT, ERR_NOT_SUPPORTED};
+use crate::{
+    dos_to_unix, err, unix_to_dos, AResult, EntryMeta, ERR_CORRUPT, ERR_INVALID_ARG,
+    ERR_NOT_SUPPORTED,
+};
 
 const SIG_LOCAL: u32 = 0x0403_4b50;
 const SIG_CENTRAL: u32 = 0x0201_4b50;
@@ -63,14 +66,31 @@ fn find_eocd(bytes: &[u8]) -> AResult<usize> {
 pub fn list(bytes: &[u8]) -> AResult<Vec<ZipEntry>> {
     let eocd = find_eocd(bytes)?;
     let disk = u16le(bytes, eocd + 4)?;
-    let total = u16le(bytes, eocd + 10)? as usize;
-    let cd_offset = u32le(bytes, eocd + 16)? as usize;
+    let entries_this_disk = u16le(bytes, eocd + 8)?;
+    let total_entries = u16le(bytes, eocd + 10)?;
+    let cd_size = u32le(bytes, eocd + 12)?;
+    let cd_offset_raw = u32le(bytes, eocd + 16)?;
     if disk != 0 {
         return err(
             ERR_NOT_SUPPORTED,
             "multi-disk ZIP archives are not supported",
         );
     }
+    // 0xFFFF / 0xFFFFFFFF are ZIP64's "the real value lives elsewhere"
+    // markers. Reading on would mis-locate the central directory, so say
+    // what is wrong instead of reporting a corrupt archive.
+    if entries_this_disk == 0xFFFF
+        || total_entries == 0xFFFF
+        || cd_size == 0xFFFF_FFFF
+        || cd_offset_raw == 0xFFFF_FFFF
+    {
+        return err(
+            ERR_NOT_SUPPORTED,
+            "ZIP64 archives are not supported in v0.2 (entry count or offset overflows the classic format)",
+        );
+    }
+    let total = total_entries as usize;
+    let cd_offset = cd_offset_raw as usize;
     if total > crate::MAX_ENTRIES {
         return err(ERR_CORRUPT, "ZIP entry count exceeds limit");
     }
@@ -92,7 +112,10 @@ pub fn list(bytes: &[u8]) -> AResult<Vec<ZipEntry>> {
         let comment_len = u16le(bytes, off + 32)? as usize;
         let local_offset = u32le(bytes, off + 42)?;
         if comp == 0xFFFF_FFFF || size == 0xFFFF_FFFF || local_offset == 0xFFFF_FFFF {
-            return err(ERR_NOT_SUPPORTED, "ZIP64 entries are not supported in v0.1");
+            return err(
+                ERR_NOT_SUPPORTED,
+                "ZIP64 entries are not supported (v0.2 writes and reads classic ZIP only)",
+            );
         }
         if flags & 1 != 0 {
             return err(ERR_NOT_SUPPORTED, "encrypted ZIP entries are not supported");
@@ -226,10 +249,34 @@ impl NewEntry {
     }
 }
 
-pub fn create(entries: &[NewEntry]) -> Vec<u8> {
+/// Write a classic ZIP (no ZIP64). Anything that needs ZIP64 — more than
+/// 65,535 entries, a member or offset at or above 4 GiB — is refused with
+/// ERR_NOT_SUPPORTED rather than written with wrapped counts.
+pub fn create(entries: &[NewEntry]) -> AResult<Vec<u8>> {
+    if entries.len() > u16::MAX as usize {
+        return err(
+            ERR_NOT_SUPPORTED,
+            "more than 65,535 entries needs ZIP64, which is not written",
+        );
+    }
     let mut out: Vec<u8> = Vec::new();
     let mut central: Vec<u8> = Vec::new();
     for e in entries {
+        if e.name.len() > u16::MAX as usize {
+            return err(ERR_INVALID_ARG, "ZIP entry name exceeds 65,535 bytes");
+        }
+        if e.data.len() as u64 > u32::MAX as u64 {
+            return err(
+                ERR_NOT_SUPPORTED,
+                format!("entry '{}' is 4 GiB or larger, which needs ZIP64", e.name),
+            );
+        }
+        if out.len() as u64 > u32::MAX as u64 {
+            return err(
+                ERR_NOT_SUPPORTED,
+                "archive exceeds 4 GiB, which needs ZIP64",
+            );
+        }
         let (time, date) = unix_to_dos(e.modified_unix);
         let crc = crc32(&e.data);
         let is_dir = e.name.ends_with('/');
@@ -279,17 +326,26 @@ pub fn create(entries: &[NewEntry]) -> Vec<u8> {
         central.extend_from_slice(&offset.to_le_bytes());
         central.extend_from_slice(name);
     }
+    // The per-entry check fails fast, but the last entry can still push the
+    // layout past 4 GiB; the offsets below are 32-bit.
+    if out.len() as u64 > u32::MAX as u64 {
+        return err(
+            ERR_NOT_SUPPORTED,
+            "archive exceeds 4 GiB, which needs ZIP64",
+        );
+    }
     let cd_offset = out.len() as u32;
     out.extend_from_slice(&central);
     out.extend_from_slice(&SIG_EOCD.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());
-    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
-    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    let count = entries.len() as u16;
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
     out.extend_from_slice(&(central.len() as u32).to_le_bytes());
     out.extend_from_slice(&cd_offset.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes()); // comment len
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -315,7 +371,7 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        let bytes = create(&sample_entries());
+        let bytes = create(&sample_entries()).unwrap();
         let listed = list(&bytes).unwrap();
         assert_eq!(listed.len(), 4);
         assert!(listed[0].meta.is_dir);
@@ -328,6 +384,42 @@ mod tests {
     }
 
     #[test]
+    fn classic_entry_count_is_enforced() {
+        // 65,535 entries fit the classic EOCD count; one more needs ZIP64,
+        // which this writer does not emit. Refusing beats writing a count
+        // that wraps to 0 and describes none of the entries.
+        let many: Vec<NewEntry> = (0..=u16::MAX)
+            .map(|i| NewEntry::file(format!("f{i}.txt"), Vec::new(), 0))
+            .collect();
+        assert_eq!(many.len(), u16::MAX as usize + 1);
+        match create(&many) {
+            Err((code, message)) => {
+                assert_eq!(code, ERR_NOT_SUPPORTED);
+                assert!(message.contains("ZIP64"), "{message}");
+            }
+            Ok(bytes) => panic!("wrote {} bytes for 65,536 entries", bytes.len()),
+        }
+    }
+
+    #[test]
+    fn zip64_markers_are_refused_not_misread() {
+        // Start from a real archive, then flip the EOCD entry count to the
+        // ZIP64 marker. This must be NOT_SUPPORTED, not a silent partial
+        // listing or a spurious corruption report.
+        let mut bytes = create(&sample_entries()).unwrap();
+        let eocd = bytes.len() - 22;
+        bytes[eocd + 10] = 0xFF;
+        bytes[eocd + 11] = 0xFF;
+        match list(&bytes) {
+            Err((code, message)) => {
+                assert_eq!(code, ERR_NOT_SUPPORTED, "{message}");
+                assert!(message.contains("ZIP64"), "{message}");
+            }
+            Ok(listed) => panic!("ZIP64 marker accepted: {} entries", listed.len()),
+        }
+    }
+
+    #[test]
     fn corruption_detected() {
         // Stored entry with known content: flipping a data byte MUST trip
         // the CRC check deterministically.
@@ -337,7 +429,7 @@ mod tests {
             modified_unix: 1_792_674_000,
             force_store: true,
         }];
-        let mut bytes = create(&entries);
+        let mut bytes = create(&entries).unwrap();
         let pos = bytes
             .windows(8)
             .position(|w| w == b"ABCDEFGH")
@@ -347,7 +439,7 @@ mod tests {
         assert!(read_entry(&bytes, &listed[0]).is_err());
         assert!(test(&bytes).is_err());
         // Truncation.
-        let bytes = create(&sample_entries());
+        let bytes = create(&sample_entries()).unwrap();
         let short = &bytes[..bytes.len() - 10];
         assert!(list(short).is_err());
     }

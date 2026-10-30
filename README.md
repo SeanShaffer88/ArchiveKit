@@ -43,6 +43,15 @@ ak_zip_append("backup.zip", "extra.log", "logs/extra.log");
   re-applied on extract. Both use the same ordering rule, directories last,
   so writing children cannot undo a parent's time and a read-only directory
   can still be populated before it is locked.
+- **Old and wrapped archives get an answer, not a shrug.** TAR reads v7 (the
+  pre-ustar format, recognised by its header checksum) as well as ustar, GNU
+  and pax. A `.tar.gz`, `.tar.bz2`, `.xz`, `.zst`, 7z or RAR file is named as
+  such — "this is gzip-compressed data, not an archive" — instead of being
+  called an unknown format.
+- **Sparse members are named, not written as stubs.** A GNU sparse entry
+  (`S`) lists as `type: sparse`, is skipped on extraction and appears in
+  `ak_last_warning()`, because its header describes only the bytes present:
+  writing it as-is would leave a file with the right name and wrong contents.
 - **Exact file times, not rounded ones.** ZIP's DOS field stores 2-second
   steps and nothing before 1980, so archives that record a real timestamp in an
   extra field (`0x5455` or NTFS `0x000A`) are read from there; the same goes for
@@ -79,7 +88,7 @@ ak_zip_append("backup.zip", "extra.log", "logs/extra.log");
 
 ## Verification status
 
-- 51 tests: 46 unit tests plus 5 integration tests. CRC vectors;
+- 55 tests: 50 unit tests plus 5 integration tests. CRC vectors;
   zlib-produced DEFLATE streams (embedded, byte-exact); deflate↔inflate
   roundtrips including incompressible data, window-edge data, block
   boundaries and multi-block streams; Huffman length limiting and

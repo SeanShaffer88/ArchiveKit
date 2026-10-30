@@ -37,6 +37,15 @@ mis-parsed as corrupt or partially listed. ZIP64 *extra fields* whose central
 directory still carries classic sizes (what streaming writers emit) remain
 readable, because sizes are taken from the central directory.
 
+**TAR variants and non-archives.** v7 headers (no `ustar` magic) are accepted
+when the header checksum validates, which is the only evidence that format
+offers; a 512-byte block of zeros with a bogus checksum is still not a tar.
+GNU sparse members are typed `sparse` and skipped rather than written: their
+header describes only the bytes present, so extraction would create a file of
+the right name with wrong contents. `.tar.gz`/`.tar.bz2`/`.xz`/`.zst`/7z/RAR
+input is refused with the container named, because the library does not
+decompress wrappers and "unknown format" would hide that.
+
 **ZIP extra fields are read for two things, and only two.** Timestamps
 (`0x5455` Unix seconds, `0x000A` NTFS FILETIME) and the Unicode path name
 (`0x7075`). The DOS time field has 2-second resolution and cannot express dates

@@ -217,18 +217,30 @@ fn write_extracted(target: &Path, data: &[u8], mtime: Option<i64>) -> AResult<()
 
 /// Human-readable note about entries extraction could not write. Lists a few
 /// names so a caller can act on it without re-listing the archive.
-fn skip_message(skipped: &[&str]) -> String {
+fn skip_message(skipped: &[(String, crate::EntryKind)]) -> String {
     const SHOWN: usize = 5;
-    let names: Vec<&str> = skipped.iter().take(SHOWN).copied().collect();
+    let names: Vec<&str> = skipped
+        .iter()
+        .take(SHOWN)
+        .map(|(n, _)| n.as_str())
+        .collect();
+    // Name the kinds that were actually skipped: "links" alone was wrong for
+    // a sparse member, and the caller may only see one of these.
+    let mut kinds: Vec<&str> = Vec::new();
+    for (_, kind) in skipped {
+        if !kinds.contains(&kind.name()) {
+            kinds.push(kind.name());
+        }
+    }
     let mut message = format!(
-        "{} entr{} skipped (not a regular file or directory, e.g. symbolic or \
-         hard links): {}",
+        "{} entr{} skipped ({}; only regular files and directories are written): {}",
         skipped.len(),
         if skipped.len() == 1 {
             "y was"
         } else {
             "ies were"
         },
+        kinds.join(", "),
         names.join(", ")
     );
     if skipped.len() > SHOWN {
@@ -392,7 +404,7 @@ fn extract_prefix(bytes: &[u8], listed: &Listed, dest: &Path, prefix: &str) -> A
     let mut directory_attributes: Vec<std::path::PathBuf> = Vec::new();
     let mut seen_files: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    let mut skipped: Vec<&str> = Vec::new();
+    let mut skipped: Vec<(String, crate::EntryKind)> = Vec::new();
     for index in 0..listed.len() {
         let meta = listed.meta_at(index);
         let slashed;
@@ -438,7 +450,7 @@ fn extract_prefix(bytes: &[u8], listed: &Listed, dest: &Path, prefix: &str) -> A
             continue;
         }
         if !meta.kind.is_extractable() {
-            skipped.push(meta.name.as_str());
+            skipped.push((meta.name.clone(), meta.kind));
             continue;
         }
         // Two entries writing one path is the archive's fault, not the
@@ -477,7 +489,7 @@ fn extract_all(bytes: &[u8], listed: &Listed, dest: &Path) -> AResult<u64> {
     let mut directory_attributes: Vec<std::path::PathBuf> = Vec::new();
     let mut seen_files: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    let mut skipped: Vec<&str> = Vec::new();
+    let mut skipped: Vec<(String, crate::EntryKind)> = Vec::new();
     for index in 0..listed.len() {
         let meta = listed.meta_at(index);
         let clean = strip_dot_slash(&meta.name);
@@ -506,7 +518,7 @@ fn extract_all(bytes: &[u8], listed: &Listed, dest: &Path) -> AResult<u64> {
             continue;
         }
         if !meta.kind.is_extractable() {
-            skipped.push(meta.name.as_str());
+            skipped.push((meta.name.clone(), meta.kind));
             continue;
         }
         // Two entries writing one path is the archive's fault, not the
@@ -1515,6 +1527,15 @@ mod tests {
 
     /// Turn one header of a normal archive into a foreign one (links),
     /// recomputing the checksum exactly as tar does.
+    fn retag(block: &mut [u8; 512], typeflag: u8) {
+        // Keeps the size field: a sparse header still describes its data blocks.
+        block[156] = typeflag;
+        block[148..156].fill(b' ');
+        let sum: u64 = block.iter().map(|&b| u64::from(b)).sum();
+        let checksum = format!("{sum:06o}\0 ");
+        block[148..156].copy_from_slice(checksum.as_bytes());
+    }
+
     fn patch_typeflag(block: &mut [u8; 512], typeflag: u8) {
         block[156] = typeflag;
         // Link headers carry no data, so the size field must be zeroed or the
@@ -1641,6 +1662,70 @@ mod tests {
         assert!(message.contains("symbolic link"), "{message}");
         // The whole archive still verifies, links included.
         assert_eq!(ak_test(archive_c.as_ptr()), 3);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sparse_members_are_skipped_and_named_as_sparse() {
+        // A GNU sparse member is not written as-is: its header describes only
+        // the bytes that are present, so extraction would produce a stub with
+        // the right name and the wrong contents.
+        let base = std::env::temp_dir().join(format!("ak-sparse-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let mut archive = tar::create(&[NewTarEntry {
+            name: "db.bin".into(),
+            data: b"abc".to_vec(),
+            modified_unix: 1_792_674_000,
+            is_dir: false,
+            read_only: false,
+        }])
+        .unwrap();
+        let mut header = [0u8; 512];
+        header.copy_from_slice(&archive[..512]);
+        retag(&mut header, b'S');
+        archive[..512].copy_from_slice(&header);
+        let path = base.join("sparse.tar");
+        fs::write(&path, &archive).unwrap();
+        let path_c = cstr(path.to_str().unwrap());
+
+        let list_ptr = ak_list_json(path_c.as_ptr());
+        assert!(!list_ptr.is_null());
+        // SAFETY: pointer came from this module in this test.
+        let json = unsafe { CStr::from_ptr(list_ptr) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        ak_free_string(list_ptr);
+        assert!(json.contains(r#""type":"sparse""#), "{json}");
+
+        let dest = base.join("out");
+        assert_eq!(
+            ak_extract(
+                path_c.as_ptr(),
+                cstr(dest.to_str().unwrap()).as_ptr(),
+                std::ptr::null()
+            ),
+            0
+        );
+        assert!(!dest.join("db.bin").exists());
+        // SAFETY: thread-local C string owned by this module.
+        let warning = unsafe { CStr::from_ptr(ak_last_warning()) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(warning.contains("sparse"), "{warning}");
+        assert!(warning.contains("db.bin"), "{warning}");
+        // Asking for it by name says what it is.
+        assert_eq!(
+            ak_extract(
+                path_c.as_ptr(),
+                cstr(dest.to_str().unwrap()).as_ptr(),
+                cstr("db.bin").as_ptr()
+            ),
+            -1
+        );
+        assert_eq!(ak_last_error_code(), crate::ERR_NOT_SUPPORTED as c_int);
         let _ = fs::remove_dir_all(&base);
     }
 

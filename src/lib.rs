@@ -87,6 +87,31 @@ impl Format {
 }
 
 /// Detect the format from content first (magic bytes), extension second.
+/// Containers that are not archives. Saying which one it is turns "unknown
+/// format" into an instruction the caller can act on.
+fn compressed_container(bytes: &[u8]) -> Option<&'static str> {
+    let starts = |sig: &[u8]| bytes.len() >= sig.len() && &bytes[..sig.len()] == sig;
+    if starts(&[0x1f, 0x8b]) {
+        Some("gzip")
+    } else if starts(b"BZh") {
+        Some("bzip2")
+    } else if starts(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
+        Some("xz")
+    } else if starts(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        Some("zstd")
+    } else if starts(&[0x04, 0x22, 0x4d, 0x18]) {
+        Some("lz4")
+    } else if starts(&[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]) {
+        Some("7z")
+    } else if starts(b"Rar!") {
+        Some("RAR")
+    } else if starts(&[0x4d, 0x53, 0x43, 0x46]) {
+        Some("CAB")
+    } else {
+        None
+    }
+}
+
 pub fn detect_format(bytes: &[u8], path_hint: &str) -> AResult<Format> {
     if bytes.len() >= 4 && &bytes[0..2] == b"PK" && bytes[2] == 3 && bytes[3] == 4 {
         return Ok(Format::Zip);
@@ -96,6 +121,23 @@ pub fn detect_format(bytes: &[u8], path_hint: &str) -> AResult<Format> {
     }
     if bytes.len() > 262 && &bytes[257..262] == b"ustar" {
         return Ok(Format::Tar);
+    }
+    // v7 tar has no magic, so the header checksum is the only evidence there
+    // is; requiring it keeps random 512-byte blobs from being called archives.
+    if bytes.len() >= 512
+        && bytes[257..263].iter().all(|&b| b == 0)
+        && tar::header_checksum_ok(&bytes[..512])
+    {
+        return Ok(Format::Tar);
+    }
+    if let Some(kind) = compressed_container(bytes) {
+        return err(
+            ERR_NOT_SUPPORTED,
+            format!(
+                "this is {kind}-compressed data, not an archive; ArchiveKit reads \
+                 uncompressed ZIP and TAR, so decompress it first"
+            ),
+        );
     }
     let lower = path_hint.to_lowercase();
     if lower.ends_with(".zip") {
@@ -119,6 +161,10 @@ pub enum EntryKind {
     Dir,
     Symlink,
     Hardlink,
+    /// A GNU sparse member: the header describes a smaller payload than the
+    /// file it stands for, so writing it as-is would leave a stub of the
+    /// right name and the wrong contents.
+    Sparse,
     Other,
 }
 
@@ -129,6 +175,7 @@ impl EntryKind {
             EntryKind::Dir => "dir",
             EntryKind::Symlink => "symlink",
             EntryKind::Hardlink => "hardlink",
+            EntryKind::Sparse => "sparse",
             EntryKind::Other => "other",
         }
     }
@@ -339,6 +386,38 @@ mod tests {
         // Pre-1980 timestamps clamp to the DOS epoch: 1980-01-01 00:00:00 UTC.
         let (t0, d0) = unix_to_dos(0);
         assert_eq!(dos_to_unix(t0, d0), 315_532_800);
+    }
+
+    #[test]
+    fn compressed_containers_say_what_they_are() {
+        // ".tar.gz" is the most common thing a user hands an archive library,
+        // so "unknown format" is the wrong answer: name the container and the
+        // reason we cannot read it.
+        for (magic, kind) in [
+            (&[0x1f, 0x8b, 0x08, 0x00][..], "gzip"),
+            (b"BZh9", "bzip2"),
+            (&[0xfd, b'7', b'z', b'X', b'Z', 0x00][..], "xz"),
+            (&[0x28, 0xb5, 0x2f, 0xfd][..], "zstd"),
+            (&[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c][..], "7z"),
+            (b"Rar!\x1a\x07", "RAR"),
+        ] {
+            let mut bytes = magic.to_vec();
+            bytes.resize(600, 0);
+            let (code, message) = detect_format(&bytes, "x.bin").unwrap_err();
+            assert_eq!(code, ERR_NOT_SUPPORTED);
+            assert!(message.contains(kind), "{kind}: {message}");
+            assert!(message.contains("decompress"), "{kind}: {message}");
+        }
+        // A trailing ".tar" or ".zip" still decides when the bytes say nothing.
+        assert_eq!(detect_format(b"junk", "a.tar").unwrap(), Format::Tar);
+        // Zero magic alone is not enough to call something a v7 tar: the
+        // header checksum has to agree.
+        let mut blob = vec![0u8; 1024];
+        assert!(detect_format(&blob, "noext").is_err());
+        blob[0] = b'x';
+        blob[100..108].copy_from_slice(b"0000644\0");
+        blob[148..156].copy_from_slice(b"garbage!");
+        assert!(detect_format(&blob, "noext").is_err());
     }
 
     #[test]

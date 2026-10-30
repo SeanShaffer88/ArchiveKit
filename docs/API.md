@@ -20,7 +20,7 @@ back to the extension. Listing JSON per entry:
 `{"name","size","compressed_size","method","is_dir","crc32","modified_unix","read_only","type"}`
 — crc32 is a hex string for ZIP entries, null for TAR; read_only reflects the
 DOS read-only attribute (ZIP) or a mode with no write bit (TAR); `type` is
-`file`, `dir`, `symlink`, `hardlink` or `other`.
+`file`, `dir`, `symlink`, `hardlink`, `sparse` or `other`.
 
 ## Timestamps
 
@@ -39,8 +39,8 @@ content is already on disk.
 ## What gets extracted
 
 Regular files and directories are written. TAR entries of any other kind —
-symbolic links, hard links, device nodes, FIFOs — are **skipped** and counted
-in `ak_last_warning()`, because Windows cannot recreate them without privilege
+symbolic links, hard links, device nodes, FIFOs, GNU sparse members — are
+**skipped** and counted in `ak_last_warning()`, because Windows cannot recreate them without privilege
 and failing the whole extraction over one link made ordinary tarballs
 unusable. The call still succeeds and returns the number of files written:
 
@@ -51,9 +51,11 @@ if (n >= 0 && ak_last_warning()[0]) {
 }
 ```
 
-Asking for such an entry *by name* is still an error (`AK_ERR_NOT_SUPPORTED`
-with the link type in the message), because there is no partial result to
-inspect. `ak_test` validates the whole archive including link entries.
+The warning names the kinds that were skipped, e.g. `2 entries were skipped
+(sparse, symlink; only regular files and directories are written): db.bin,
+link.txt`. Asking for such an entry *by name* is still an error
+(`AK_ERR_NOT_SUPPORTED` with the kind in the message), because there is no
+partial result to inspect. `ak_test` validates the whole archive including link entries.
 
 Entry names are matched exactly. A directory is also found when the
 caller writes its name with or without the trailing `/` that ZIP uses.

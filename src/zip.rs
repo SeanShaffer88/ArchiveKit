@@ -63,6 +63,19 @@ fn find_eocd(bytes: &[u8]) -> AResult<usize> {
     err(ERR_CORRUPT, "end of central directory not found")
 }
 
+/// Read-only bit from a central-directory record. Unix-made archives
+/// (host 3 = Unix, 19 = OS X) put a POSIX mode in the high half and the DOS
+/// attribute byte in the low half; DOS/Windows-made archives only use the
+/// low byte, where 0x01 is the read-only attribute.
+fn decode_read_only(version_made_by: u16, external_attributes: u32) -> bool {
+    let host = (version_made_by >> 8) & 0xFF;
+    let unix_mode = (external_attributes >> 16) & 0xFFFF;
+    if matches!(host, 3 | 19) && unix_mode != 0 {
+        return unix_mode & 0o200 == 0;
+    }
+    external_attributes & 0x01 != 0
+}
+
 /// IBM code page 437 for bytes 0x80..=0xFF, the encoding APPNOTE 4.4.4
 /// assigns to ZIP names that do not set the UTF-8 flag. Legacy Windows
 /// tools (and DOS-era archives) store names this way; without this table a
@@ -152,9 +165,11 @@ pub fn list(bytes: &[u8]) -> AResult<Vec<ZipEntry>> {
         let crc = u32le(bytes, off + 16)?;
         let comp = u32le(bytes, off + 20)?;
         let size = u32le(bytes, off + 24)?;
+        let version_made_by = u16le(bytes, off + 4)?;
         let name_len = u16le(bytes, off + 28)? as usize;
         let extra_len = u16le(bytes, off + 30)? as usize;
         let comment_len = u16le(bytes, off + 32)? as usize;
+        let external_attributes = u32le(bytes, off + 38)?;
         let local_offset = u32le(bytes, off + 42)?;
         if comp == 0xFFFF_FFFF || size == 0xFFFF_FFFF || local_offset == 0xFFFF_FFFF {
             return err(
@@ -184,6 +199,7 @@ pub fn list(bytes: &[u8]) -> AResult<Vec<ZipEntry>> {
                 is_dir,
                 crc32: Some(crc),
                 modified_unix: Some(dos_to_unix(mtime, mdate)),
+                read_only: decode_read_only(version_made_by, external_attributes),
             },
             method_id: method,
             local_offset: local_offset as u64,
@@ -269,6 +285,8 @@ pub struct NewEntry {
     /// Store without compression (small or incompressible data is chosen
     /// automatically anyway; this forces it).
     pub force_store: bool,
+    /// Record the DOS read-only attribute for this entry.
+    pub read_only: bool,
 }
 
 impl NewEntry {
@@ -278,6 +296,7 @@ impl NewEntry {
             data,
             modified_unix,
             force_store: false,
+            read_only: false,
         }
     }
     pub fn dir(name: impl Into<String>, modified_unix: i64) -> Self {
@@ -290,6 +309,7 @@ impl NewEntry {
             data: Vec::new(),
             modified_unix,
             force_store: true,
+            read_only: false,
         }
     }
 }
@@ -367,7 +387,9 @@ pub fn create(entries: &[NewEntry]) -> AResult<Vec<u8>> {
         central.extend_from_slice(&0u16.to_le_bytes()); // comment
         central.extend_from_slice(&0u16.to_le_bytes()); // disk
         central.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
-        central.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+                                                        // DOS attribute byte: 0x10 marks a directory, 0x01 read-only.
+        let attributes: u32 = if is_dir { 0x10 } else { 0 } | if e.read_only { 0x01 } else { 0 };
+        central.extend_from_slice(&attributes.to_le_bytes());
         central.extend_from_slice(&offset.to_le_bytes());
         central.extend_from_slice(name);
     }
@@ -491,6 +513,24 @@ mod tests {
     }
 
     #[test]
+    fn read_only_bit_decodes_for_dos_and_unix_hosts() {
+        // DOS/Windows-made: low byte, bit 0 is the read-only attribute.
+        assert!(decode_read_only(0x0014, 0x01));
+        assert!(!decode_read_only(0x0014, 0x20)); // archive bit only
+        assert!(decode_read_only(0x0014, 0x11)); // read-only directory
+                                                 // Unix host (3) and OS X (19): a POSIX mode in the high half wins,
+                                                 // because DOS tools set the low byte to 0 and would say "writable".
+        assert!(decode_read_only(0x0314, 0o444u32 << 16));
+        assert!(!decode_read_only(0x0314, 0o644u32 << 16));
+        assert!(decode_read_only(0x1314, 0o555u32 << 16));
+        // No mode recorded: fall back to the DOS byte rather than treating a
+        // mode of 0 as read-only.
+        assert!(!decode_read_only(0x0314, 0));
+        // One we write ourselves: DOS host, plain file.
+        assert!(!decode_read_only(0x0014, 0));
+    }
+
+    #[test]
     fn legacy_cp437_names_are_decoded() {
         // APPNOTE 4.4.4: without the UTF-8 flag, names are CP437. 0x82 is
         // 'é', so this is the DOS-era spelling of "café-pré.txt" and used
@@ -570,6 +610,7 @@ mod tests {
             data: b"ABCDEFGH".repeat(20).to_vec(),
             modified_unix: 1_792_674_000,
             force_store: true,
+            read_only: false,
         }];
         let mut bytes = create(&entries).unwrap();
         let pos = bytes

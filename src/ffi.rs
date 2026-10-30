@@ -180,6 +180,15 @@ fn write_extracted(target: &Path, data: &[u8], mtime: Option<i64>) -> AResult<()
     Ok(())
 }
 
+/// Apply a recorded read-only attribute. Files get this right after their
+/// content; directories only once every child exists, or the directory could
+/// not be written into.
+fn apply_read_only(path: &Path, read_only: bool) {
+    if read_only {
+        let _ = platform::set_read_only(path, true);
+    }
+}
+
 /// Apply recorded directory times once every file has been written. Writing
 /// children updates a parent's mtime, so directory times are set last (and
 /// deepest-first) or the walk would undo them.
@@ -305,6 +314,7 @@ fn extract_prefix(bytes: &[u8], listed: &Listed, dest: &Path, prefix: &str) -> A
     let basename = prefix.rsplit('/').next().unwrap_or(&prefix).to_string();
     let mut count = 0u64;
     let mut directory_times: Vec<(std::path::PathBuf, i64)> = Vec::new();
+    let mut directory_attributes: Vec<std::path::PathBuf> = Vec::new();
     for index in 0..listed.len() {
         let meta = listed.meta_at(index);
         let slashed;
@@ -342,21 +352,29 @@ fn extract_prefix(bytes: &[u8], listed: &Listed, dest: &Path, prefix: &str) -> A
         if meta.is_dir {
             safe_directories(&target)?;
             if let Some(seconds) = meta.modified_unix.filter(|&secs| secs > 0) {
-                directory_times.push((target, seconds));
+                directory_times.push((target.clone(), seconds));
+            }
+            if meta.read_only {
+                directory_attributes.push(target);
             }
             continue;
         }
         let data = listed.read(bytes, index)?;
         write_extracted(&target, &data, meta.modified_unix)?;
+        apply_read_only(&target, meta.read_only);
         count += 1;
     }
     apply_directory_times(directory_times);
+    for path in directory_attributes.into_iter().rev() {
+        apply_read_only(&path, true);
+    }
     Ok(count)
 }
 
 fn extract_all(bytes: &[u8], listed: &Listed, dest: &Path) -> AResult<u64> {
     let mut count = 0u64;
     let mut directory_times: Vec<(std::path::PathBuf, i64)> = Vec::new();
+    let mut directory_attributes: Vec<std::path::PathBuf> = Vec::new();
     for index in 0..listed.len() {
         let meta = listed.meta_at(index);
         let clean = strip_dot_slash(&meta.name);
@@ -377,15 +395,22 @@ fn extract_all(bytes: &[u8], listed: &Listed, dest: &Path) -> AResult<u64> {
         if meta.is_dir {
             safe_directories(&target)?;
             if let Some(seconds) = meta.modified_unix.filter(|&secs| secs > 0) {
-                directory_times.push((target, seconds));
+                directory_times.push((target.clone(), seconds));
+            }
+            if meta.read_only {
+                directory_attributes.push(target);
             }
             continue;
         }
         let data = listed.read(bytes, index)?;
         write_extracted(&target, &data, meta.modified_unix)?;
+        apply_read_only(&target, meta.read_only);
         count += 1;
     }
     apply_directory_times(directory_times);
+    for path in directory_attributes.into_iter().rev() {
+        apply_read_only(&path, true);
+    }
     Ok(count)
 }
 
@@ -523,6 +548,7 @@ pub extern "C" fn ak_extract(
         ))?;
         let data = listed.read(&bytes, index)?;
         write_extracted(&target, &data, meta.modified_unix)?;
+        apply_read_only(&target, meta.read_only);
         Ok(1)
     });
     match run {
@@ -573,8 +599,8 @@ fn collected_zip_entries(root: &str) -> AResult<Vec<NewEntry>> {
     let items = platform::collect(root)?;
     let mut out = Vec::with_capacity(items.len());
     for it in items {
-        if it.is_dir {
-            out.push(NewEntry::dir(it.arcname, it.modified_unix));
+        let mut entry = if it.is_dir {
+            NewEntry::dir(it.arcname, it.modified_unix)
         } else {
             let data = std::fs::read(&it.full_path).map_err(|e| {
                 (
@@ -582,8 +608,10 @@ fn collected_zip_entries(root: &str) -> AResult<Vec<NewEntry>> {
                     format!("cannot read {}: {e}", it.full_path.display()),
                 )
             })?;
-            out.push(NewEntry::file(it.arcname, data, it.modified_unix));
-        }
+            NewEntry::file(it.arcname, data, it.modified_unix)
+        };
+        entry.read_only = it.read_only;
+        out.push(entry);
     }
     Ok(out)
 }
@@ -617,6 +645,7 @@ fn create_impl(archive: &str, root: &str, fmt: Format) -> AResult<i64> {
                     data,
                     modified_unix: it.modified_unix,
                     is_dir: it.is_dir,
+                    read_only: it.read_only,
                 });
             }
             let n = entries.len() as i64;
@@ -693,19 +722,17 @@ pub extern "C" fn ak_zip_append(
         let mut entries: Vec<NewEntry> = Vec::new();
         for index in 0..listed.len() {
             let meta = listed.meta_at(index);
-            if meta.is_dir {
-                entries.push(NewEntry::dir(
+            let mut entry = if meta.is_dir {
+                NewEntry::dir(
                     meta.name.trim_end_matches('/'),
                     meta.modified_unix.unwrap_or(0),
-                ));
+                )
             } else {
                 let data = listed.read(&bytes, index)?;
-                entries.push(NewEntry::file(
-                    meta.name.clone(),
-                    data,
-                    meta.modified_unix.unwrap_or(0),
-                ));
-            }
+                NewEntry::file(meta.name.clone(), data, meta.modified_unix.unwrap_or(0))
+            };
+            entry.read_only = meta.read_only;
+            entries.push(entry);
         }
         let data = std::fs::read(&file)
             .map_err(|e| (ERR_NOT_FOUND, format!("cannot read '{file}': {e}")))?;
@@ -1087,6 +1114,7 @@ mod tests {
             data: b"payload".to_vec(),
             modified_unix: STAMP + 1,
             is_dir: false,
+            read_only: false,
         }])
         .unwrap();
         fs::write(&tar_path, tar_bytes).unwrap();
@@ -1110,6 +1138,7 @@ mod tests {
                 data: b"x".to_vec(),
                 modified_unix: 0,
                 is_dir: false,
+                read_only: false,
             }])
             .unwrap(),
         )
@@ -1127,6 +1156,110 @@ mod tests {
             mtime_of(&zero_dest.join("c.txt")) > 1_700_000_000,
             "a zero TAR timestamp is treated as unknown"
         );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ffi_read_only_attribute_roundtrips() {
+        // A read-only file must stay read-only after create + extract, in
+        // both formats, or a restored backup silently changes permissions.
+        fn make_read_only(path: &std::path::Path) {
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_readonly(true);
+            fs::set_permissions(path, perms).unwrap();
+        }
+        fn make_writable(path: &std::path::Path) {
+            let mut perms = fs::symlink_metadata(path).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            fs::set_permissions(path, perms).unwrap();
+        }
+        fn is_read_only(path: &std::path::Path) -> bool {
+            fs::metadata(path).unwrap().permissions().readonly()
+        }
+        let base = std::env::temp_dir().join(format!("ak-ro-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("src");
+        fs::create_dir_all(src.join("locked-dir")).unwrap();
+        fs::write(src.join("locked.txt"), b"locked").unwrap();
+        fs::write(src.join("free.txt"), b"free").unwrap();
+        fs::write(src.join("locked-dir/inner.txt"), b"inner").unwrap();
+        make_read_only(&src.join("locked.txt"));
+        make_read_only(&src.join("locked-dir"));
+
+        for format in [Format::Zip, Format::Tar] {
+            let archive = base.join(format!("archive.{}", format.name()));
+            let archive_c = cstr(archive.to_str().unwrap());
+            let root_c = cstr(src.to_str().unwrap());
+            let created = match format {
+                Format::Zip => ak_create_zip(archive_c.as_ptr(), root_c.as_ptr()),
+                Format::Tar => ak_create_tar(archive_c.as_ptr(), root_c.as_ptr()),
+            };
+            assert_eq!(created, 4, "{}", format.name());
+
+            // The listing reports the attribute.
+            let list_ptr = ak_list_json(archive_c.as_ptr());
+            assert!(!list_ptr.is_null());
+            // SAFETY: pointer came from this module in this test.
+            let json = unsafe { CStr::from_ptr(list_ptr) }
+                .to_str()
+                .unwrap()
+                .to_string();
+            ak_free_string(list_ptr);
+            assert!(
+                json.contains(r#"{"name":"locked.txt","size":6"#)
+                    && json.contains(r#""read_only":true"#),
+                "{}: {json}",
+                format.name()
+            );
+            assert!(
+                json.contains(r#"{"name":"free.txt","size":4"#)
+                    && json.contains(r#""read_only":false"#),
+                "{}: {json}",
+                format.name()
+            );
+
+            let dest = base.join(format!("out-{}", format.name()));
+            assert_eq!(
+                ak_extract(
+                    archive_c.as_ptr(),
+                    cstr(dest.to_str().unwrap()).as_ptr(),
+                    std::ptr::null()
+                ),
+                3, // locked.txt, free.txt, locked-dir/inner.txt
+                "{}",
+                format.name()
+            );
+            assert!(
+                is_read_only(&dest.join("locked.txt")),
+                "{}: locked.txt lost its attribute",
+                format.name()
+            );
+            assert!(
+                !is_read_only(&dest.join("free.txt")),
+                "{}: free.txt became read-only",
+                format.name()
+            );
+            assert!(
+                is_read_only(&dest.join("locked-dir")),
+                "{}: locked-dir lost its attribute",
+                format.name()
+            );
+            // Children were written before the directory was locked, so
+            // extraction had to reach into it while it was still writable.
+            assert_eq!(
+                fs::read(dest.join("locked-dir").join("inner.txt")).unwrap(),
+                b"inner"
+            );
+            // Leave the tree writable so the temp-directory cleanup works on
+            // Windows, where read-only blocks deletion.
+            make_writable(&dest.join("locked-dir").join("inner.txt"));
+            make_writable(&dest.join("locked-dir"));
+            make_writable(&dest.join("locked.txt"));
+        }
+        make_writable(&src.join("locked.txt"));
+        make_writable(&src.join("locked-dir"));
+        make_writable(&src.join("locked-dir").join("inner.txt"));
         let _ = fs::remove_dir_all(&base);
     }
 

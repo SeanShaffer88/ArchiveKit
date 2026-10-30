@@ -198,6 +198,7 @@ pub fn list(bytes: &[u8]) -> AResult<Vec<TarEntry>> {
             name.clone_from(override_name);
         }
         let size = pending.size.unwrap_or(header_size);
+        let mode = parse_octal(&block[100..108])?;
         let mut mtime = parse_octal(&block[136..148])? as i64;
         if let Some(override_mtime) = pending.mtime {
             mtime = override_mtime;
@@ -216,6 +217,9 @@ pub fn list(bytes: &[u8]) -> AResult<Vec<TarEntry>> {
                 is_dir,
                 crc32: None,
                 modified_unix: Some(mtime),
+                // A zero mode means "not recorded"; only a real mode with no
+                // write bit at all counts as read-only.
+                read_only: mode != 0 && mode & 0o200 == 0,
             },
             data_offset,
             typeflag,
@@ -277,6 +281,8 @@ pub struct NewTarEntry {
     pub data: Vec<u8>,
     pub modified_unix: i64,
     pub is_dir: bool,
+    /// Record a mode without a write bit (0444 files, 0555 directories).
+    pub read_only: bool,
 }
 
 /// Write an octal field with a trailing NUL, refusing values that would not
@@ -335,7 +341,13 @@ pub fn create(entries: &[NewTarEntry]) -> AResult<Vec<u8>> {
         if !prefix.is_empty() {
             header[345..345 + prefix.len()].copy_from_slice(prefix.as_bytes());
         }
-        write_octal(&mut header[100..108], if e.is_dir { 0o755 } else { 0o644 })?;
+        let mode = match (e.is_dir, e.read_only) {
+            (true, false) => 0o755,
+            (true, true) => 0o555,
+            (false, false) => 0o644,
+            (false, true) => 0o444,
+        };
+        write_octal(&mut header[100..108], mode)?;
         write_octal(&mut header[108..116], 0)?;
         write_octal(&mut header[116..124], 0)?;
         let size = if e.is_dir { 0 } else { e.data.len() as u64 };
@@ -372,6 +384,7 @@ mod tests {
             data: body.to_vec(),
             modified_unix: 1_792_674_000,
             is_dir,
+            read_only: false,
         }
     }
 
@@ -532,6 +545,40 @@ mod tests {
         assert_eq!(listed[0].meta.modified_unix, Some(1_600_000_000));
         assert_eq!(read_entry(&bytes, &listed[0]).unwrap(), b"nine byte");
         assert_eq!(test(&bytes).unwrap(), 1);
+    }
+
+    #[test]
+    fn modes_mark_read_only_entries() {
+        // What the writer records for a read-only file and directory.
+        let bytes = create(&[
+            entry("free.txt", b"x", false),
+            NewTarEntry {
+                read_only: true,
+                ..entry("locked.txt", b"y", false)
+            },
+            NewTarEntry {
+                read_only: true,
+                ..entry("locked-dir", b"", true)
+            },
+        ])
+        .unwrap();
+        let listed = list(&bytes).unwrap();
+        assert!(!listed[0].meta.read_only, "0644 file is writable");
+        assert!(listed[1].meta.read_only, "0444 file is read-only");
+        assert!(listed[2].meta.read_only, "0555 directory is read-only");
+        assert_eq!(&bytes[100..108], b"0000644\0");
+        // A zero mode means "not recorded" and must not read as read-only.
+        let mut header = raw_header(b"unknown.txt", 0, b'0');
+        header[100..108].copy_from_slice(b"0000000\0");
+        for b in &mut header[148..156] {
+            *b = b' ';
+        }
+        let sum: u64 = header.iter().map(|&b| b as u64).sum();
+        header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        let mut archive = Vec::new();
+        push_record(&mut archive, header, b"");
+        archive.extend_from_slice(&[0u8; 1024]);
+        assert!(!list(&archive).unwrap()[0].meta.read_only);
     }
 
     #[test]

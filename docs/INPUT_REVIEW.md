@@ -92,6 +92,20 @@ extraction into an error. This adds one more attribute write per entry, so an
 entry name that resolves to a path the process may write but not re-attribute
 now produces a file with the wrong (current) time rather than an error.
 
+**Read-only attribute.** Create records whether a source file or directory is
+read-only, `ak_list_json` reports it, and extraction re-applies it. Two
+ordering rules keep it safe: a file is marked only after its content *and*
+timestamp are written, and a directory is marked only after every child
+exists, in reverse order, because a read-only directory can still be written
+into on Unix but Windows will refuse new children. On Unix the owner write bit
+is dropped from all three permission triads, so "read-only" means read-only
+for every account rather than just the owner. Failures are ignored like
+timestamp failures. The practical consequence worth knowing: extracting a
+read-only tree and then trying to modify or delete it inside the same process
+will fail until the attribute is cleared, exactly as it would for a real copy.
+A zero TAR mode is treated as "not recorded" and does not make an entry
+read-only.
+
 **What is still not proven.** No new Windows-native adversarial run was made
 for this change; Windows CI (fmt, clippy, test, release build, then
 `tests/native_interop.py` against the built DLL) is the native gate, and the

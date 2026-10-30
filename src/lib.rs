@@ -120,6 +120,10 @@ pub struct EntryMeta {
     pub is_dir: bool,
     pub crc32: Option<u32>,
     pub modified_unix: Option<i64>,
+    /// The entry is marked read-only. ZIP carries this as the DOS read-only
+    /// attribute (or a Unix mode without a write bit), TAR as a mode without
+    /// a write bit. Extraction re-applies it; nothing else is preserved.
+    pub read_only: bool,
 }
 
 impl EntryMeta {
@@ -133,14 +137,15 @@ impl EntryMeta {
             None => "null".to_string(),
         };
         format!(
-            "{{\"name\":\"{}\",\"size\":{},\"compressed_size\":{},\"method\":\"{}\",\"is_dir\":{},\"crc32\":{},\"modified_unix\":{}}}",
+            "{{\"name\":\"{}\",\"size\":{},\"compressed_size\":{},\"method\":\"{}\",\"is_dir\":{},\"crc32\":{},\"modified_unix\":{},\"read_only\":{}}}",
             json_escape(&self.name),
             self.size,
             self.compressed_size,
             json_escape(&self.method),
             self.is_dir,
             crc,
-            mtime
+            mtime,
+            self.read_only
         )
     }
 }

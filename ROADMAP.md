@@ -9,6 +9,10 @@ extraction.
   block with dynamic Huffman codes (fixed-Huffman per block when that is
   smaller). Measured within ~0-2% of zlib/Info-ZIP level 6 on text, prose,
   logs and mixed binary; v0.1's fixed-Huffman output was 10-20% larger.
+- The read-only attribute round-trips: create records it (DOS attribute in
+  ZIP, mode without a write bit in TAR), `ak_list_json` reports it, and
+  extract re-applies it — directories last, so a read-only directory can
+  still be populated first.
 - Extraction restores the archive's modified times (files, and listed
   directories after their children are written) through `utimensat` on Unix
   and `SetFileTime` on Windows — declared in `platform.rs`, no new
@@ -42,9 +46,9 @@ extraction.
   whose sizes only appear in the trailing descriptor.
 - TAR GNU `L` output on create (names that cannot be prefix-split), plus
   symlink/hardlink records behind an explicit opt-in.
-- Restore file *permissions* and Windows attributes on extract. Timestamps
-  are done (files and listed directories); modes still are not carried
-  through create or applied on extract.
+- Full permission restore: the read-only bit now round-trips, but complete
+  POSIX modes (executable bits, group/other), ACLs and Windows hidden/system
+  attributes are still not carried or applied.
 - Streaming API for archives too large to hold in memory comfortably.
 
 **Later**

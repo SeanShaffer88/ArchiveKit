@@ -17,8 +17,9 @@ Authoritative declaration: `../include/archivekit.h`.
 
 Format is detected from content (ZIP signature / ustar magic), falling
 back to the extension. Listing JSON per entry:
-`{"name","size","compressed_size","method","is_dir","crc32","modified_unix"}`
-— crc32 is a hex string for ZIP entries, null for TAR.
+`{"name","size","compressed_size","method","is_dir","crc32","modified_unix","read_only"}`
+— crc32 is a hex string for ZIP entries, null for TAR; read_only reflects the
+DOS read-only attribute (ZIP) or a mode with no write bit (TAR).
 
 Entry names are matched exactly. A directory is also found when the
 caller writes its name with or without the trailing `/` that ZIP uses.
@@ -31,6 +32,15 @@ APPNOTE 4.4.4 assigns to unflagged names and what DOS-era Windows tools
 wrote. The high half of CP437 is all non-ASCII printable characters, so this
 decoding cannot introduce a path separator, drive colon or device name — the
 traversal guard still sees exactly one place where separators can appear.
+
+## Attributes
+
+Only the read-only bit is carried. Create records it from the source file
+(`Permissions::readonly()`, i.e. the owner write bit on Unix and the
+attribute on Windows); extract re-applies it to files immediately and to
+directories after their children exist, so a read-only directory can still be
+populated. Full POSIX modes, ACLs and Windows hidden/system bits are not
+preserved and are not applied.
 
 ## Timestamps
 
@@ -94,6 +104,7 @@ non-UTF-8 arguments). Details via `ak_last_error()` (thread-local).
 - TAR *writing* is ustar only: names must fit the 155+100 byte prefix
   split. Longer names are refused — GNU `L` output is roadmap. Reading
   handles GNU `L` and pax `x` records, so those archives extract fine.
+- Attributes: only the read-only bit round-trips (see above).
 - Timestamps: ZIP stores DOS time (2-second resolution, 1980-2107); TAR
   stores whole seconds. Extraction restores the archive's modified time on
   files and on listed directories (directories last, so writing children

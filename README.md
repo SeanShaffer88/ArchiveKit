@@ -37,9 +37,12 @@ ak_zip_append("backup.zip", "extra.log", "logs/extra.log");
   and a 45 KB text sample to 189 bytes against 195 (97%). v0.1's
   fixed-Huffman encoder needed 417 bytes for that last sample.
 - **Extraction restores what the archive recorded.** Modified times are
-  applied to files and to listed directories (directories last, so writing
-  children cannot undo them) via `utimensat`/`SetFileTime`, declared in
-  `platform.rs` — still zero dependencies.
+  applied to files and to listed directories (via `utimensat`/`SetFileTime`,
+  declared in `platform.rs` — still zero dependencies), and the read-only
+  attribute round-trips: recorded on create, reported in the listing,
+  re-applied on extract. Both use the same ordering rule, directories last,
+  so writing children cannot undo a parent's time and a read-only directory
+  can still be populated before it is locked.
 - **Traversal-safe by construction.** Every extraction path is joined
   through a guard that refuses absolute paths, drive-relative names, and
   `..` escapes — archives are untrusted input.

@@ -25,8 +25,10 @@
  *   honoured (long link names are not).
  * - Extraction is traversal-safe: an entry that would land outside the
  *   destination directory aborts extraction with AK_ERR_CORRUPT.
- * - Extraction restores entry modified times (best effort; a filesystem
- *   that rejects them does not fail the call).
+ * - Extraction restores entry modified times and the read-only attribute
+ *   (best effort; a filesystem that rejects them does not fail the call).
+ *   Only the read-only bit is carried — not full modes, ACLs or hidden and
+ *   system attributes.
  */
 
 #ifndef ARCHIVEKIT_H
@@ -66,7 +68,8 @@ AK_API void ak_free_string(char *p);          /* frees ak_list_json results */
 
 /* Read --------------------------------------------------------------------- */
 /* JSON array: [{"name":"...","size":N,"compressed_size":N,"method":"deflate",
- * "is_dir":false,"crc32":"0d4a1185" (or null),"modified_unix":N (or null)}]
+ * "is_dir":false,"crc32":"0d4a1185" (or null),"modified_unix":N (or null),
+ * "read_only":false}]
  * Format is detected from content, falling back to the file extension. */
 AK_API char *ak_list_json(const char *archive_utf8);
 /* Verify structure + full decompression + CRC (ZIP). Returns entry count. */

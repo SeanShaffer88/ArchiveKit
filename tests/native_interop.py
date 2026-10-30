@@ -246,6 +246,30 @@ with tempfile.TemporaryDirectory(prefix="archivekit-interop-") as folder:
     assert extract_prefix(tree, root / "bad", "../docs") == -1
     assert lib.ak_last_error_code() == 1  # AK_ERR_INVALID_ARG
 
+    # ---- long TAR names on create use a GNU 'L' record --------------------
+    # 306 bytes with no legal ustar prefix split: the old writer refused
+    # these, which made tar creation fail on deep Windows trees.
+    long_dir = "x" * 100 + "/" + "y" * 100
+    long_src = root / "long-src"
+    (long_src / long_dir).mkdir(parents=True)
+    long_leaf = "z" * 100 + ".txt"
+    (long_src / long_dir / long_leaf).write_bytes(b"deep path payload")
+    long_arc = root / "long-names.tar"
+    assert lib.ak_create_tar(str(long_arc).encode(), str(long_src).encode()) == 3
+    assert b"././@LongLink" in long_arc.read_bytes(), "expected a GNU long-name record"
+    expected_name = long_dir + "/" + long_leaf
+    with tarfile.open(long_arc) as t:
+        assert expected_name in t.getnames(), [len(n) for n in t.getnames()]
+        assert t.extractfile(expected_name).read() == b"deep path payload"
+    assert test(long_arc) == 3
+    dest = root / "long-out"
+    assert extract(long_arc, dest) == 1
+    assert (dest / expected_name).read_bytes() == b"deep path payload"
+    # Names that fit stay plain ustar: no long-name record in that archive.
+    plain_arc = root / "plain-names.tar"
+    assert lib.ak_create_tar(str(plain_arc).encode(), str(source).encode()) == 2
+    assert b"././@LongLink" not in plain_arc.read_bytes()
+
     # ---- restored timestamps, in both directions ---------------------------
     stamped = root / "stamped.zip"
     with zipfile.ZipFile(stamped, "w", zipfile.ZIP_DEFLATED) as z:
@@ -331,6 +355,7 @@ with tempfile.TemporaryDirectory(prefix="archivekit-interop-") as folder:
 print(
     "Native interop passed: Python ZIP store/deflate, streaming and legacy "
     "CP437 archives and GNU/pax TAR -> DLL; DLL ZIP (dynamic Huffman) and "
-    "TAR (prefix split) -> Python; folder extraction, timestamp and "
-    "read-only restoration, ZIP64 and traversal refusals verified"
+    "TAR (prefix split, GNU long names) -> Python; folder extraction, "
+    "timestamp and read-only restoration, ZIP64 and traversal refusals "
+    "verified"
 )

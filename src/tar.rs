@@ -311,31 +311,91 @@ fn write_octal(field: &mut [u8], value: u64) -> AResult<()> {
 /// before it and at most 100 after it. Byte counts, not characters — the
 /// fields are byte-limited, so a UTF-8 name can be well under 100 chars and
 /// still not fit.
-fn split_name(path: &str) -> AResult<(String, String)> {
+fn split_name(path: &str) -> Option<(String, String)> {
     if path.len() <= 100 {
-        return Ok((String::new(), path.to_string()));
+        return Some((String::new(), path.to_string()));
     }
     let split = path.rmatch_indices('/').find(|&(idx, _)| {
         let prefix = &path[..idx];
         let rest = &path[idx + 1..];
         !prefix.is_empty() && !rest.is_empty() && prefix.len() <= 155 && rest.len() <= 100
     });
-    match split {
-        Some((idx, _)) => Ok((path[..idx].to_string(), path[idx + 1..].to_string())),
-        None => err(
+    split.map(|(idx, _)| (path[..idx].to_string(), path[idx + 1..].to_string()))
+}
+
+/// Longest prefix of `name` that fits `max` bytes without splitting a UTF-8
+/// sequence. Only used for the placeholder in a header whose real name lives
+/// in a preceding GNU `L` record, so tools that ignore the record still see a
+/// valid (if truncated) ustar header.
+fn truncate_name(name: &str, max: usize) -> &str {
+    if name.len() <= max {
+        return name;
+    }
+    let mut end = max;
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
+}
+
+/// Checksum field last: it covers every other byte of the header.
+fn seal_header(header: &mut [u8; 512]) {
+    for b in &mut header[148..156] {
+        *b = b' ';
+    }
+    let sum: u64 = header.iter().map(|&b| b as u64).sum();
+    header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+}
+
+/// GNU long-name record: a header named "././@LongLink" of type `'L'` whose
+/// data is the NUL-terminated real name, immediately followed by the entry's
+/// own (truncated) header. GNU tar, bsdtar, 7-Zip and Python's tarfile all
+/// read it; strict ustar-only readers see just the truncated name. Used only
+/// when a name cannot be expressed as ustar prefix + name, so ordinary
+/// archives stay plain ustar.
+fn write_long_name_record(out: &mut Vec<u8>, name: &str, modified_unix: i64) -> AResult<()> {
+    if name.len() + 1 > MAX_META_BYTES as usize {
+        return err(
             ERR_NOT_SUPPORTED,
             format!(
-                "tar entry name does not fit ustar's 155+100 byte prefix split \
-                 (long-name records are a roadmap item): {path}"
+                "tar entry name is {} bytes; long-name records are capped at {} bytes",
+                name.len(),
+                MAX_META_BYTES - 1
             ),
-        ),
+        );
     }
+    let mut header = [0u8; 512];
+    header[..13].copy_from_slice(b"././@LongLink");
+    write_octal(&mut header[100..108], 0o644)?;
+    write_octal(&mut header[108..116], 0)?;
+    write_octal(&mut header[116..124], 0)?;
+    write_octal(&mut header[124..136], name.len() as u64 + 1)?;
+    write_octal(&mut header[136..148], modified_unix.max(0) as u64)?;
+    header[156] = b'L';
+    // GNU magic/version for the record itself ("ustar" + two spaces + NUL),
+    // which is what GNU tar writes and what every GNU-aware reader expects.
+    header[257..265].copy_from_slice(b"ustar  \0");
+    seal_header(&mut header);
+    out.extend_from_slice(&header);
+    out.extend_from_slice(name.as_bytes());
+    out.push(0);
+    let pad = (512 - ((name.len() + 1) % 512)) % 512;
+    out.resize(out.len() + pad, 0u8);
+    Ok(())
 }
 
 pub fn create(entries: &[NewTarEntry]) -> AResult<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
     for e in entries {
-        let (prefix, name) = split_name(&e.name)?;
+        // ustar prefix split when the name fits, GNU `L` when it does not.
+        let split = split_name(&e.name);
+        let (prefix, name) = match &split {
+            Some((prefix, name)) => (prefix.clone(), name.clone()),
+            None => {
+                write_long_name_record(&mut out, &e.name, e.modified_unix)?;
+                (String::new(), truncate_name(&e.name, 100).to_string())
+            }
+        };
         let mut header = [0u8; 512];
         header[..name.len()].copy_from_slice(name.as_bytes());
         if !prefix.is_empty() {
@@ -356,13 +416,7 @@ pub fn create(entries: &[NewTarEntry]) -> AResult<Vec<u8>> {
         header[156] = if e.is_dir { b'5' } else { b'0' };
         header[257..263].copy_from_slice(b"ustar\0");
         header[263..265].copy_from_slice(b"00");
-        // Checksum: field treated as spaces while summing.
-        for b in &mut header[148..156] {
-            *b = b' ';
-        }
-        let sum: u64 = header.iter().map(|&b| b as u64).sum();
-        let chk = format!("{sum:06o}\0 ");
-        header[148..156].copy_from_slice(chk.as_bytes());
+        seal_header(&mut header);
         out.extend_from_slice(&header);
         if !e.is_dir {
             out.extend_from_slice(&e.data);
@@ -424,6 +478,17 @@ mod tests {
         }
     }
 
+    fn bytes_of(name: &str) -> Vec<u8> {
+        create(&[entry(name, b"x", false)]).unwrap()
+    }
+
+    /// True when the archive carries a GNU long-name record.
+    fn contains_long_link(bytes: &[u8]) -> bool {
+        bytes.chunks(512).any(|block| {
+            block.len() == 512 && &block[..13] == b"././@LongLink" && block[156] == b'L'
+        })
+    }
+
     fn push_record(out: &mut Vec<u8>, header: [u8; 512], data: &[u8]) {
         out.extend_from_slice(&header);
         out.extend_from_slice(data);
@@ -468,11 +533,14 @@ mod tests {
         let edge = format!("{}/{}", "p".repeat(155), "n".repeat(100));
         let bytes = create(&[entry(&edge, b"edge", false)]).unwrap();
         assert_eq!(list(&bytes).unwrap()[0].meta.name, edge);
-        // One byte over either field cannot be expressed in ustar.
+        // One byte over either field cannot be expressed in ustar, so the
+        // writer falls back to a GNU long-name record instead of cutting it.
         let over = format!("{}/{}", "p".repeat(155), "n".repeat(101));
-        assert!(create(&[entry(&over, b"x", false)]).is_err());
-        // No slash at all: nothing to split on, so it is refused, not cut.
-        assert!(create(&[entry(&"z".repeat(200), b"x", false)]).is_err());
+        let bytes = create(&[entry(&over, b"x", false)]).unwrap();
+        assert!(contains_long_link(&bytes), "expected a GNU 'L' record");
+        assert_eq!(list(&bytes).unwrap()[0].meta.name, over);
+        // Names that fit get no long-name record at all.
+        assert!(!contains_long_link(&bytes_of(&edge)));
     }
 
     #[test]
@@ -481,12 +549,67 @@ mod tests {
         let fits = "ü".repeat(50);
         let bytes = create(&[entry(&fits, b"a", false)]).unwrap();
         assert_eq!(list(&bytes).unwrap()[0].meta.name, fits);
-        // 60 x 'é' is 120 bytes with no slash: unrepresentable, refused.
-        assert!(create(&[entry(&"é".repeat(60), b"a", false)]).is_err());
+        // 60 x 'é' is 120 bytes with no slash: no ustar split exists, so it
+        // goes through a GNU long-name record and comes back intact.
+        let wide = "é".repeat(60);
+        let bytes = create(&[entry(&wide, b"a", false)]).unwrap();
+        assert_eq!(list(&bytes).unwrap()[0].meta.name, wide);
         // With a slash it splits by byte count (120 bytes prefix + name).
         let split = format!("{}/tail.txt", "é".repeat(60));
         let bytes = create(&[entry(&split, b"a", false)]).unwrap();
         assert_eq!(list(&bytes).unwrap()[0].meta.name, split);
+    }
+
+    #[test]
+    fn unrepresentable_names_fall_back_to_gnu_long_records() {
+        // Longer than 100 bytes with no `/` and longer than any prefix split:
+        // the old writer refused these, which made tar creation fail on
+        // ordinary Windows trees with deep paths.
+        let name = format!("{}/{}", "dir".repeat(60), "file".repeat(40));
+        assert!(name.len() > 255);
+        let bytes = create(&[NewTarEntry {
+            read_only: true,
+            ..entry(&name, b"payload", false)
+        }])
+        .unwrap();
+        assert!(contains_long_link(&bytes));
+        let listed = list(&bytes).unwrap();
+        assert_eq!(listed.len(), 1, "the 'L' record is not an entry");
+        assert_eq!(listed[0].meta.name, name);
+        assert_eq!(listed[0].meta.size, 7);
+        assert!(
+            listed[0].meta.read_only,
+            "mode survives the long-name record"
+        );
+        assert_eq!(read_entry(&bytes, &listed[0]).unwrap(), b"payload");
+        assert_eq!(test(&bytes).unwrap(), 1);
+        // The placeholder in the real header is valid UTF-8 (truncation must
+        // not split a character), and the record's data is the whole name.
+        let header = &bytes[512..1024];
+        let placeholder = &header[..100];
+        let end = placeholder.iter().position(|&b| b == 0).unwrap_or(100);
+        std::str::from_utf8(&placeholder[..end]).expect("placeholder is valid UTF-8");
+        // A directory with an unrepresentable name works too.
+        let dir_name = "d".repeat(300);
+        let bytes = create(&[NewTarEntry {
+            name: dir_name.clone(),
+            data: Vec::new(),
+            modified_unix: 1_792_674_000,
+            is_dir: true,
+            read_only: false,
+        }])
+        .unwrap();
+        assert_eq!(list(&bytes).unwrap()[0].meta.name, dir_name);
+        // Names beyond the reader's metadata cap are refused rather than
+        // written as an archive this library could not open again.
+        let too_long = "n".repeat(MAX_META_BYTES as usize);
+        match create(&[entry(&too_long, b"", false)]) {
+            Err((code, message)) => {
+                assert_eq!(code, ERR_NOT_SUPPORTED);
+                assert!(message.contains("long-name"), "{message}");
+            }
+            Ok(_) => panic!("wrote a name beyond the metadata cap"),
+        }
     }
 
     #[test]

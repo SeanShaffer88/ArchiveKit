@@ -20,7 +20,8 @@
  *   valid UTF-8); otherwise legacy CP437, which is what APPNOTE 4.4.4
  *   assigns to unflagged names.
  * - TAR: ustar, files + directories. On create, names use the 100-byte
- *   name field or a 155+100 byte prefix split; longer names are refused.
+ *   name field or a 155+100 byte prefix split; anything longer is written
+ *   as a GNU 'L' long-name record (read by GNU tar, bsdtar, 7-Zip, Python).
  *   On read, GNU 'L' long names and pax 'x' path/size/mtime records are
  *   honoured (long link names are not).
  * - Extraction is traversal-safe: an entry that would land outside the

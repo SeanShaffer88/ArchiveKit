@@ -25,6 +25,8 @@
  *   honoured (long link names are not).
  * - Extraction is traversal-safe: an entry that would land outside the
  *   destination directory aborts extraction with AK_ERR_CORRUPT.
+ * - Extraction restores entry modified times (best effort; a filesystem
+ *   that rejects them does not fail the call).
  */
 
 #ifndef ARCHIVEKIT_H

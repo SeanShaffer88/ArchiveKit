@@ -131,7 +131,10 @@ fn safe_directories(path: &Path) -> AResult<()> {
     Ok(())
 }
 
-fn write_extracted(target: &Path, data: &[u8]) -> AResult<()> {
+/// Write one extracted file and restore its modified time. The time is
+/// best-effort: the content is already on disk, so a filesystem or attribute
+/// set that rejects the timestamp must not fail the extraction.
+fn write_extracted(target: &Path, data: &[u8], mtime: Option<i64>) -> AResult<()> {
     use std::io::Write;
     if let Some(parent) = target.parent() {
         safe_directories(parent)?;
@@ -168,7 +171,22 @@ fn write_extracted(target: &Path, data: &[u8]) -> AResult<()> {
             },
         );
     }
+    // Close before touching attributes: Windows refuses SetFileTime on a
+    // path whose handle is still open for writing.
+    drop(output);
+    if let Some(seconds) = mtime.filter(|&secs| secs > 0) {
+        let _ = platform::set_mtime(target, seconds);
+    }
     Ok(())
+}
+
+/// Apply recorded directory times once every file has been written. Writing
+/// children updates a parent's mtime, so directory times are set last (and
+/// deepest-first) or the walk would undo them.
+fn apply_directory_times(directory_times: Vec<(std::path::PathBuf, i64)>) {
+    for (path, seconds) in directory_times.into_iter().rev() {
+        let _ = platform::set_mtime(&path, seconds);
+    }
 }
 
 /// An opened archive's entries, parsed once and reused for listing,
@@ -286,6 +304,7 @@ fn extract_prefix(bytes: &[u8], listed: &Listed, dest: &Path, prefix: &str) -> A
     }
     let basename = prefix.rsplit('/').next().unwrap_or(&prefix).to_string();
     let mut count = 0u64;
+    let mut directory_times: Vec<(std::path::PathBuf, i64)> = Vec::new();
     for index in 0..listed.len() {
         let meta = listed.meta_at(index);
         let slashed;
@@ -322,17 +341,22 @@ fn extract_prefix(bytes: &[u8], listed: &Listed, dest: &Path, prefix: &str) -> A
         ))?;
         if meta.is_dir {
             safe_directories(&target)?;
+            if let Some(seconds) = meta.modified_unix.filter(|&secs| secs > 0) {
+                directory_times.push((target, seconds));
+            }
             continue;
         }
         let data = listed.read(bytes, index)?;
-        write_extracted(&target, &data)?;
+        write_extracted(&target, &data, meta.modified_unix)?;
         count += 1;
     }
+    apply_directory_times(directory_times);
     Ok(count)
 }
 
 fn extract_all(bytes: &[u8], listed: &Listed, dest: &Path) -> AResult<u64> {
     let mut count = 0u64;
+    let mut directory_times: Vec<(std::path::PathBuf, i64)> = Vec::new();
     for index in 0..listed.len() {
         let meta = listed.meta_at(index);
         let clean = strip_dot_slash(&meta.name);
@@ -352,12 +376,16 @@ fn extract_all(bytes: &[u8], listed: &Listed, dest: &Path) -> AResult<u64> {
         ))?;
         if meta.is_dir {
             safe_directories(&target)?;
+            if let Some(seconds) = meta.modified_unix.filter(|&secs| secs > 0) {
+                directory_times.push((target, seconds));
+            }
             continue;
         }
         let data = listed.read(bytes, index)?;
-        write_extracted(&target, &data)?;
+        write_extracted(&target, &data, meta.modified_unix)?;
         count += 1;
     }
+    apply_directory_times(directory_times);
     Ok(count)
 }
 
@@ -494,7 +522,7 @@ pub extern "C" fn ak_extract(
             ),
         ))?;
         let data = listed.read(&bytes, index)?;
-        write_extracted(&target, &data)?;
+        write_extracted(&target, &data, meta.modified_unix)?;
         Ok(1)
     });
     match run {
@@ -990,6 +1018,114 @@ mod tests {
                 std::ptr::null()
             ),
             -1
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ffi_extraction_restores_timestamps() {
+        // 2026-10-20 15:40:00 UTC, an even second so ZIP's 2-second DOS
+        // resolution round-trips exactly. This runs the platform timestamp
+        // path for real: utimensat on Unix, SetFileTime on Windows CI.
+        const STAMP: i64 = 1_792_510_800;
+        fn mtime_of(path: &std::path::Path) -> i64 {
+            fs::metadata(path)
+                .unwrap()
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+        }
+        let base = std::env::temp_dir().join(format!("ak-time-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let zip_path = base.join("t.zip");
+        fs::write(
+            &zip_path,
+            zip::create(&[
+                NewEntry::dir("dir", STAMP),
+                NewEntry::file("dir/a.txt", b"alpha".to_vec(), STAMP),
+                // ZIP cannot express "before 1980": DOS time clamps a zero
+                // timestamp to 1980-01-01, and that is what extraction
+                // restores — the archive's statement, not the clock.
+                NewEntry::file("epoch.txt", b"beta".to_vec(), 0),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        let dest = base.join("out");
+        assert_eq!(
+            ak_extract(
+                cstr(zip_path.to_str().unwrap()).as_ptr(),
+                cstr(dest.to_str().unwrap()).as_ptr(),
+                std::ptr::null()
+            ),
+            2
+        );
+        assert_eq!(mtime_of(&dest.join("dir").join("a.txt")), STAMP);
+        // Directory times are applied after the children are written, so the
+        // walk cannot leave the parent stamped with "now".
+        assert_eq!(mtime_of(&dest.join("dir")), STAMP);
+        assert_eq!(mtime_of(&dest.join("epoch.txt")), 315_532_800);
+        // Single-entry extraction restores it too (and keeps the full
+        // archive path, as documented for ak_extract).
+        let single = base.join("single");
+        assert_eq!(
+            ak_extract(
+                cstr(zip_path.to_str().unwrap()).as_ptr(),
+                cstr(single.to_str().unwrap()).as_ptr(),
+                cstr("dir/a.txt").as_ptr()
+            ),
+            1
+        );
+        assert_eq!(mtime_of(&single.join("dir").join("a.txt")), STAMP);
+        // And TAR (second resolution, no DOS quantization).
+        let tar_path = base.join("t.tar");
+        let tar_bytes = tar::create(&[NewTarEntry {
+            name: "b.txt".into(),
+            data: b"payload".to_vec(),
+            modified_unix: STAMP + 1,
+            is_dir: false,
+        }])
+        .unwrap();
+        fs::write(&tar_path, tar_bytes).unwrap();
+        let tar_dest = base.join("tarout");
+        assert_eq!(
+            ak_extract(
+                cstr(tar_path.to_str().unwrap()).as_ptr(),
+                cstr(tar_dest.to_str().unwrap()).as_ptr(),
+                std::ptr::null()
+            ),
+            1
+        );
+        assert_eq!(mtime_of(&tar_dest.join("b.txt")), STAMP + 1);
+        // TAR *can* say zero (1970), which archive tools also use for "no
+        // timestamp". That case is left alone rather than stamped 1970.
+        let zero_tar = base.join("zero.tar");
+        fs::write(
+            &zero_tar,
+            tar::create(&[NewTarEntry {
+                name: "c.txt".into(),
+                data: b"x".to_vec(),
+                modified_unix: 0,
+                is_dir: false,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+        let zero_dest = base.join("zerotar");
+        assert_eq!(
+            ak_extract(
+                cstr(zero_tar.to_str().unwrap()).as_ptr(),
+                cstr(zero_dest.to_str().unwrap()).as_ptr(),
+                std::ptr::null()
+            ),
+            1
+        );
+        assert!(
+            mtime_of(&zero_dest.join("c.txt")) > 1_700_000_000,
+            "a zero TAR timestamp is treated as unknown"
         );
         let _ = fs::remove_dir_all(&base);
     }

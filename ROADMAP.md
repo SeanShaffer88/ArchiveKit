@@ -9,6 +9,11 @@ extraction.
   block with dynamic Huffman codes (fixed-Huffman per block when that is
   smaller). Measured within ~0-2% of zlib/Info-ZIP level 6 on text, prose,
   logs and mixed binary; v0.1's fixed-Huffman output was 10-20% larger.
+- Extraction restores the archive's modified times (files, and listed
+  directories after their children are written) through `utimensat` on Unix
+  and `SetFileTime` on Windows — declared in `platform.rs`, no new
+  dependency. ZIP's zero time clamps to 1980; a zero TAR time is treated as
+  unknown and left alone.
 - New ABI call `ak_extract_prefix`: extract one folder with the prefix
   stripped from the written paths, matched on path component boundaries.
   Only selected entries are traversal-checked, so a hostile entry elsewhere
@@ -37,8 +42,9 @@ extraction.
   whose sizes only appear in the trailing descriptor.
 - TAR GNU `L` output on create (names that cannot be prefix-split), plus
   symlink/hardlink records behind an explicit opt-in.
-- Restore timestamps and attributes on extract (the archive already carries
-  them; extraction currently creates files with "now").
+- Restore file *permissions* and Windows attributes on extract. Timestamps
+  are done (files and listed directories); modes still are not carried
+  through create or applied on extract.
 - Streaming API for archives too large to hold in memory comfortably.
 
 **Later**

@@ -43,6 +43,10 @@ ak_zip_append("backup.zip", "extra.log", "logs/extra.log");
   re-applied on extract. Both use the same ordering rule, directories last,
   so writing children cannot undo a parent's time and a read-only directory
   can still be populated before it is locked.
+- **Creating reports what it left out.** Symlinks are never followed (they can
+  point anywhere) and unreadable directories are skipped, but neither is
+  dropped in silence: `ak_last_warning()` names them after `ak_create_zip` /
+  `ak_create_tar`, so an archive never quietly claims to be a full copy.
 - **Appending never loses the archive's own note.** `ak_zip_append` keeps the
   ZIP archive comment, and refuses a name that is absolute, contains `..`, or
   already exists — appending is not a way to build an archive this library
@@ -92,7 +96,7 @@ ak_zip_append("backup.zip", "extra.log", "logs/extra.log");
 
 ## Verification status
 
-- 57 tests: 52 unit tests plus 5 integration tests. CRC vectors;
+- 58 tests: 53 unit tests plus 5 integration tests. CRC vectors;
   zlib-produced DEFLATE streams (embedded, byte-exact); deflate↔inflate
   roundtrips including incompressible data, window-edge data, block
   boundaries and multi-block streams; Huffman length limiting and

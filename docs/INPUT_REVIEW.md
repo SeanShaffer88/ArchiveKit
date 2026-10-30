@@ -37,6 +37,14 @@ mis-parsed as corrupt or partially listed. ZIP64 *extra fields* whose central
 directory still carries classic sizes (what streaming writers emit) remain
 readable, because sizes are taken from the central directory.
 
+**Create-side omissions are reported, never silent.** The folder walk skips
+symlinks (following one is how a "backup" ends up containing `/etc` or a
+user's SSH key) and unreadable directories, and both were previously dropped
+without a word, which made the resulting archive indistinguishable from a
+complete copy. They now appear in `ak_last_warning()` with the same wording
+extraction uses. The walk also refuses to dereference anything: `file_type()`
+comes from the directory entry, so a link's target is never stat'ed.
+
 **Appending is held to the same rules as extracting.** `ak_zip_append`
 rebuilds the archive, so it is also the one place where an archive could be
 *build* with a name this library would refuse to extract. Names are therefore

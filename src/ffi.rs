@@ -745,8 +745,44 @@ pub extern "C" fn ak_extract_prefix(
 // Create operations
 // ---------------------------------------------------------------------------
 
+/// The same wording extraction uses, for the same reason: a caller that only
+/// reads the return value must still be able to learn that the archive is not
+/// a full copy of the folder.
+fn omissions_message(skipped: &[platform::Skipped]) -> String {
+    const SHOWN: usize = 5;
+    let names: Vec<&str> = skipped
+        .iter()
+        .take(SHOWN)
+        .map(|s| s.name.as_str())
+        .collect();
+    let mut kinds: Vec<&str> = Vec::new();
+    for item in skipped {
+        if !kinds.contains(&item.what) {
+            kinds.push(item.what);
+        }
+    }
+    let mut message = format!(
+        "{} entr{} skipped ({}; only regular files and directories are archived): {}",
+        skipped.len(),
+        if skipped.len() == 1 {
+            "y was"
+        } else {
+            "ies were"
+        },
+        kinds.join(", "),
+        names.join(", ")
+    );
+    if skipped.len() > SHOWN {
+        message.push_str(&format!(" and {} more", skipped.len() - SHOWN));
+    }
+    message
+}
+
 fn collected_zip_entries(root: &str) -> AResult<Vec<NewEntry>> {
-    let items = platform::collect(root)?;
+    let (items, skipped) = platform::collect(root)?;
+    if !skipped.is_empty() {
+        set_warning(&omissions_message(&skipped));
+    }
     let mut out = Vec::with_capacity(items.len());
     for it in items {
         let mut entry = if it.is_dir {
@@ -777,7 +813,10 @@ fn create_impl(archive: &str, root: &str, fmt: Format) -> AResult<i64> {
             Ok(n)
         }
         Format::Tar => {
-            let items = platform::collect(root)?;
+            let (items, skipped) = platform::collect(root)?;
+            if !skipped.is_empty() {
+                set_warning(&omissions_message(&skipped));
+            }
             let mut entries = Vec::with_capacity(items.len());
             for it in items {
                 let data = if it.is_dir {
@@ -1755,6 +1794,47 @@ mod tests {
             -1
         );
         assert_eq!(ak_last_error_code(), crate::ERR_NOT_SUPPORTED as c_int);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creating_an_archive_reports_what_it_left_out() {
+        // Symlinks are never followed - a link can point anywhere - but an
+        // archive that silently lacks them is a copy that lies about being one.
+        let base = std::env::temp_dir().join(format!("ak-links-create-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("tree")).unwrap();
+        fs::write(base.join("tree/real.txt"), b"real").unwrap();
+        std::os::unix::fs::symlink("real.txt", base.join("tree/link.txt")).unwrap();
+        std::os::unix::fs::symlink("/etc", base.join("tree/outside")).unwrap();
+
+        for (create, name) in [
+            (
+                ak_create_zip as extern "C" fn(*const c_char, *const c_char) -> i64,
+                "tree.zip",
+            ),
+            (
+                ak_create_tar as extern "C" fn(*const c_char, *const c_char) -> i64,
+                "tree.tar",
+            ),
+        ] {
+            let archive = base.join(name);
+            let n = create(
+                cstr(archive.to_str().unwrap()).as_ptr(),
+                cstr(base.join("tree").to_str().unwrap()).as_ptr(),
+            );
+            assert_eq!(n, 1, "{name}: only the regular file is an entry");
+            // SAFETY: thread-local C string owned by this module.
+            let warning = unsafe { CStr::from_ptr(ak_last_warning()) }
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(warning.contains("2 entries were skipped"), "{warning}");
+            assert!(warning.contains("symlink"), "{warning}");
+            assert!(warning.contains("link.txt"), "{warning}");
+            assert!(warning.contains("outside"), "{warning}");
+        }
         let _ = fs::remove_dir_all(&base);
     }
 

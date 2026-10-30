@@ -24,10 +24,19 @@ pub struct Collected {
     pub read_only: bool,
 }
 
+/// Something the walk refused to archive. Reported to the caller instead of
+/// vanishing: an archive that quietly lacks half a tree is worse than one that
+/// says what it left out.
+#[derive(Clone, Debug)]
+pub struct Skipped {
+    pub name: String,
+    pub what: &'static str,
+}
+
 /// Walk `root`, returning entries in sorted order (directories before
 /// their contents, since names sort that way with the trailing slash
 /// convention handled by callers).
-pub fn collect(root: &str) -> AResult<Vec<Collected>> {
+pub fn collect(root: &str) -> AResult<(Vec<Collected>, Vec<Skipped>)> {
     let root_path = std::path::Path::new(root);
     let meta = std::fs::metadata(root_path)
         .map_err(|e| (ERR_NOT_FOUND, format!("cannot read root '{root}': {e}")))?;
@@ -35,6 +44,7 @@ pub fn collect(root: &str) -> AResult<Vec<Collected>> {
         return err(ERR_PLATFORM, format!("'{root}' is not a directory"));
     }
     let mut out: Vec<Collected> = Vec::new();
+    let mut skipped: Vec<Skipped> = Vec::new();
     let mut total_bytes: u64 = 0;
     let mut stack = vec![root_path.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -43,7 +53,17 @@ pub fn collect(root: &str) -> AResult<Vec<Collected>> {
         // crosses directories that even an administrator cannot read.
         let rd = match std::fs::read_dir(&dir) {
             Ok(rd) => rd,
-            Err(_) => continue,
+            Err(_) => {
+                let name = dir
+                    .strip_prefix(root_path)
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| dir.to_string_lossy().to_string());
+                skipped.push(Skipped {
+                    name,
+                    what: "unreadable directory",
+                });
+                continue;
+            }
         };
         for entry in rd.flatten() {
             let ft = match entry.file_type() {
@@ -51,6 +71,16 @@ pub fn collect(root: &str) -> AResult<Vec<Collected>> {
                 Err(_) => continue,
             };
             if ft.is_symlink() {
+                // Never followed (a link can point anywhere, including out of
+                // the tree), but never dropped in silence either.
+                skipped.push(Skipped {
+                    name: entry
+                        .path()
+                        .strip_prefix(root_path)
+                        .map(|p| p.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_else(|_| entry.file_name().to_string_lossy().to_string()),
+                    what: "symlink",
+                });
                 continue;
             }
             let path = entry.path();
@@ -119,7 +149,8 @@ pub fn collect(root: &str) -> AResult<Vec<Collected>> {
         }
     }
     out.sort_by(|a, b| a.arcname.cmp(&b.arcname));
-    Ok(out)
+    skipped.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok((out, skipped))
 }
 
 // ---------------------------------------------------------------------------

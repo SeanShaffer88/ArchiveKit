@@ -121,6 +121,103 @@ fn decode_name(raw: &[u8], flags: u16) -> String {
         .collect()
 }
 
+/// Extra-field tags this reader interprets. Everything else in an extra
+/// field is skipped, as before: extras are a hint box, not a contract.
+const EXTRA_EXTENDED_TIMESTAMP: u16 = 0x5455;
+const EXTRA_NTFS: u16 = 0x000a;
+const EXTRA_UNICODE_PATH: u16 = 0x7075;
+
+/// Walk an extra field and return the first record with `tag`. A record that
+/// overruns the field ends the walk: the archive is what it is, and a broken
+/// extra must not become an error when the entry itself is readable.
+fn extra_record(extra: &[u8], tag: u16) -> Option<&[u8]> {
+    let mut off = 0usize;
+    while off + 4 <= extra.len() {
+        let id = u16::from_le_bytes([extra[off], extra[off + 1]]);
+        let len = u16::from_le_bytes([extra[off + 2], extra[off + 3]]) as usize;
+        let start = off + 4;
+        let end = start.checked_add(len)?;
+        if end > extra.len() {
+            return None;
+        }
+        if id == tag {
+            return Some(&extra[start..end]);
+        }
+        off = end;
+    }
+    None
+}
+
+/// 100 ns ticks since 1601-01-01 to Unix seconds. Only values that land in a
+/// sane range survive; anything else means "no usable timestamp" and the DOS
+/// field is used instead.
+fn filetime_to_unix(ticks: u64) -> Option<i64> {
+    const TICKS_PER_SEC: u64 = 10_000_000;
+    const EPOCH_DIFF_SECS: i64 = 11_644_473_600;
+    let secs = i64::try_from(ticks / TICKS_PER_SEC).ok()?;
+    let unix = secs.checked_sub(EPOCH_DIFF_SECS)?;
+    if (0..=253_402_300_799).contains(&unix) {
+        Some(unix)
+    } else {
+        None
+    }
+}
+
+/// The exact modification time when the writer recorded one. The DOS field
+/// has 2-second resolution and cannot express dates outside 1980-2107, so
+/// writers that care add 0x5455 (Unix seconds, Info-ZIP) or 0x000A (NTFS
+/// FILETIME, Windows). Rounding a 2001 timestamp to the next even second, or
+/// reporting 1980 for a 1975 file, is a wrong answer, not a rounding detail.
+fn extra_mtime(extra: &[u8]) -> Option<i64> {
+    if let Some(data) = extra_record(extra, EXTRA_EXTENDED_TIMESTAMP) {
+        let flags = *data.first()?;
+        if flags & 1 != 0 && data.len() >= 5 {
+            let secs = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
+            if secs != 0 {
+                return Some(i64::from(secs));
+            }
+        }
+    }
+    // NTFS: 4 reserved bytes, then tag/size pairs; tag 1 holds mtime, atime
+    // and ctime as FILETIMEs.
+    let ntfs = extra_record(extra, EXTRA_NTFS)?;
+    let mut off = 4usize;
+    while off + 4 <= ntfs.len() {
+        let tag = u16::from_le_bytes([ntfs[off], ntfs[off + 1]]);
+        let len = u16::from_le_bytes([ntfs[off + 2], ntfs[off + 3]]) as usize;
+        let start = off + 4;
+        if start.checked_add(len)? > ntfs.len() {
+            return None;
+        }
+        if tag == 1 && len >= 8 {
+            let ticks = u64::from_le_bytes(ntfs[start..start + 8].try_into().ok()?);
+            return filetime_to_unix(ticks);
+        }
+        off = start + len;
+    }
+    None
+}
+
+/// 0x7075 carries the entry name as UTF-8 for writers whose name field is a
+/// legacy code page. The CRC of the raw name guards against stale records; a
+/// name that is empty or holds a NUL is refused, since neither can become a
+/// path. Names stay untrusted input either way: `safe_join` still decides.
+fn extra_unicode_name(extra: &[u8], raw_name: &[u8]) -> Option<String> {
+    let data = extra_record(extra, EXTRA_UNICODE_PATH)?;
+    if data.len() < 5 || data[0] != 1 {
+        return None;
+    }
+    let recorded = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
+    if recorded != crc32(raw_name) {
+        return None;
+    }
+    let text = std::str::from_utf8(&data[5..]).ok()?;
+    if text.is_empty() || text.contains('\0') {
+        return None;
+    }
+    Some(text.to_string())
+}
+
 pub fn list(bytes: &[u8]) -> AResult<Vec<ZipEntry>> {
     let eocd = find_eocd(bytes)?;
     let disk = u16le(bytes, eocd + 4)?;
@@ -152,8 +249,22 @@ pub fn list(bytes: &[u8]) -> AResult<Vec<ZipEntry>> {
     if total > crate::MAX_ENTRIES {
         return err(ERR_CORRUPT, "ZIP entry count exceeds limit");
     }
+    // Self-extractors and installers prepend a stub, so the recorded offsets
+    // are short by its size. The central directory always ends exactly where
+    // the EOCD begins, which pins its real position; that is only trusted
+    // when the signature is actually there, and the same shift is then
+    // applied to every local header offset.
+    let mut shift = 0i64;
+    if u32le(bytes, cd_offset).unwrap_or(0) != SIG_CENTRAL {
+        if let Some(actual) = eocd.checked_sub(cd_size as usize) {
+            if actual + cd_size as usize == eocd && u32le(bytes, actual).unwrap_or(0) == SIG_CENTRAL
+            {
+                shift = actual as i64 - cd_offset as i64;
+            }
+        }
+    }
     let mut entries = Vec::with_capacity(total);
-    let mut off = cd_offset;
+    let mut off = (cd_offset as i64 + shift) as usize;
     for _ in 0..total {
         if u32le(bytes, off)? != SIG_CENTRAL {
             return err(ERR_CORRUPT, "bad central directory signature");
@@ -181,10 +292,13 @@ pub fn list(bytes: &[u8]) -> AResult<Vec<ZipEntry>> {
             return err(ERR_NOT_SUPPORTED, "encrypted ZIP entries are not supported");
         }
         let name_start = off + 46;
-        if name_start + name_len > bytes.len() {
+        if name_start + name_len + extra_len > bytes.len() {
             return err(ERR_CORRUPT, "central directory name overruns archive");
         }
-        let name = decode_name(&bytes[name_start..name_start + name_len], flags);
+        let raw_name = &bytes[name_start..name_start + name_len];
+        let extra = &bytes[name_start + name_len..name_start + name_len + extra_len];
+        let name =
+            extra_unicode_name(extra, raw_name).unwrap_or_else(|| decode_name(raw_name, flags));
         // ZIP marks directories with a trailing `/`, but some writers only
         // set the DOS directory attribute (0x10) and leave the name bare.
         // Trusting the slash alone turned those into zero-byte files.
@@ -201,7 +315,9 @@ pub fn list(bytes: &[u8]) -> AResult<Vec<ZipEntry>> {
                 },
                 is_dir,
                 crc32: Some(crc),
-                modified_unix: Some(dos_to_unix(mtime, mdate)),
+                modified_unix: Some(
+                    extra_mtime(extra).unwrap_or_else(|| dos_to_unix(mtime, mdate)),
+                ),
                 kind: if is_dir {
                     crate::EntryKind::Dir
                 } else {
@@ -210,7 +326,12 @@ pub fn list(bytes: &[u8]) -> AResult<Vec<ZipEntry>> {
                 read_only: decode_read_only(version_made_by, external_attributes),
             },
             method_id: method,
-            local_offset: local_offset as u64,
+            local_offset: u64::try_from(local_offset as i64 + shift).map_err(|_| {
+                (
+                    ERR_CORRUPT,
+                    "entry offset points before the archive".to_string(),
+                )
+            })?,
         });
         off = name_start + name_len + extra_len + comment_len;
     }
@@ -220,7 +341,15 @@ pub fn list(bytes: &[u8]) -> AResult<Vec<ZipEntry>> {
 /// Decompress + verify one entry's data.
 pub fn read_entry(bytes: &[u8], entry: &ZipEntry) -> AResult<Vec<u8>> {
     if entry.meta.size > crate::MAX_ENTRY_BYTES as u64 {
-        return err(ERR_CORRUPT, "ZIP entry exceeds output limit");
+        return err(
+            ERR_CORRUPT,
+            format!(
+                "entry '{}' is {} bytes, over the {} MiB per-entry limit",
+                entry.meta.name,
+                entry.meta.size,
+                crate::MAX_ENTRY_BYTES / (1024 * 1024)
+            ),
+        );
     }
     let off = entry.local_offset as usize;
     if u32le(bytes, off)? != SIG_LOCAL {
@@ -442,6 +571,186 @@ mod tests {
             ),
             NewEntry::file("empty.bin", Vec::new(), 1_792_674_000),
         ]
+    }
+
+    /// Build a one-entry STORE archive with explicit extra fields, DOS time
+    /// and date, and an optional prefix of foreign bytes, so the reader can
+    /// be tested against byte sequences it never writes itself.
+    fn hand_built_extras(
+        name: &[u8],
+        data: &[u8],
+        extra: &[u8],
+        dos_time: u16,
+        dos_date: u16,
+        prefix: &[u8],
+    ) -> Vec<u8> {
+        let crc = crc32(data);
+        let mut out = Vec::new();
+        out.extend_from_slice(&SIG_LOCAL.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // flags
+        out.extend_from_slice(&0u16.to_le_bytes()); // store
+        out.extend_from_slice(&dos_time.to_le_bytes());
+        out.extend_from_slice(&dos_date.to_le_bytes());
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(extra.len() as u16).to_le_bytes());
+        out.extend_from_slice(name);
+        out.extend_from_slice(extra);
+        out.extend_from_slice(data);
+        // Offsets are recorded as if the prefix were not there, exactly like a
+        // real self-extractor's stub.
+        let cd_offset = out.len() as u32;
+        let cd_start = out.len();
+        out.extend_from_slice(&SIG_CENTRAL.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // flags
+        out.extend_from_slice(&0u16.to_le_bytes()); // store
+        out.extend_from_slice(&dos_time.to_le_bytes());
+        out.extend_from_slice(&dos_date.to_le_bytes());
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(extra.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        out.extend_from_slice(&0u16.to_le_bytes()); // disk
+        out.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+        out.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+        out.extend_from_slice(&0u32.to_le_bytes()); // local offset
+        out.extend_from_slice(name);
+        out.extend_from_slice(extra);
+        let cd_size = (out.len() - cd_start) as u32;
+        out.extend_from_slice(&SIG_EOCD.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_offset.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        let mut archive = prefix.to_vec();
+        archive.extend_from_slice(&out);
+        archive
+    }
+
+    /// One extra-field record as it appears on disk: tag, length, payload.
+    fn extra(tag: u16, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn exact_times_come_from_extras() {
+        // 2001-01-21T12:20:01Z: an odd second the DOS field cannot express,
+        // so 0x5455 must win over the stored 2-second value.
+        let mut payload = vec![1u8]; // flags: mtime present
+        payload.extend_from_slice(&979_902_001u32.to_le_bytes());
+        let stamp = extra(0x5455, &payload);
+        let archive = hand_built_extras(b"a.txt", b"hi", &stamp, 0, 0x21, b"");
+        let listed = list(&archive).unwrap();
+        assert_eq!(listed[0].meta.modified_unix, Some(979_902_001));
+
+        // A pre-1980 timestamp (DOS clamps to 1980) survives too.
+        let mut old = vec![1u8];
+        old.extend_from_slice(&100_000_000u32.to_le_bytes());
+        let archive = hand_built_extras(b"a.txt", b"hi", &extra(0x5455, &old), 0, 0x21, b"");
+        assert_eq!(
+            list(&archive).unwrap()[0].meta.modified_unix,
+            Some(100_000_000)
+        );
+
+        // Windows writes 0x000A: reserved word, then tag 1 with FILETIMEs.
+        let mut ntfs = vec![0u8; 4];
+        ntfs.extend_from_slice(&1u16.to_le_bytes());
+        ntfs.extend_from_slice(&24u16.to_le_bytes());
+        ntfs.extend_from_slice(&128_000_000_000_000_000u64.to_le_bytes());
+        ntfs.extend_from_slice(&0u64.to_le_bytes());
+        ntfs.extend_from_slice(&0u64.to_le_bytes());
+        let archive = hand_built_extras(b"a.txt", b"hi", &extra(0x000a, &ntfs), 0, 0x21, b"");
+        assert_eq!(
+            list(&archive).unwrap()[0].meta.modified_unix,
+            Some(1_155_526_400)
+        );
+
+        // Flags saying "no mtime" and a zero timestamp both fall back to DOS.
+        let none = extra(0x5455, &[0u8, 0, 0, 0, 0]);
+        let archive = hand_built_extras(b"a.txt", b"hi", &none, 0, 0x21, b"");
+        assert_eq!(
+            list(&archive).unwrap()[0].meta.modified_unix,
+            Some(crate::dos_to_unix(0, 0x21))
+        );
+    }
+
+    #[test]
+    fn unicode_path_extra_wins_over_the_legacy_name() {
+        // Java's zipfs and some 7-Zip settings write the name in a legacy code
+        // page and put UTF-8 in 0x7075. CP437 alone turned this into `cafΘ`.
+        let raw = b"caf\xe9.txt";
+        let utf8 = "café.txt".as_bytes();
+        let mut payload = vec![1u8]; // version
+        payload.extend_from_slice(&crc32(raw).to_le_bytes());
+        payload.extend_from_slice(utf8);
+        let archive = hand_built_extras(raw, b"hi", &extra(0x7075, &payload), 0, 0x21, b"");
+        assert_eq!(list(&archive).unwrap()[0].meta.name, "café.txt");
+
+        // A stale record (wrong CRC) is ignored rather than trusted.
+        let mut stale = vec![1u8];
+        stale.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+        stale.extend_from_slice(utf8);
+        let archive = hand_built_extras(raw, b"hi", &extra(0x7075, &stale), 0, 0x21, b"");
+        assert_ne!(list(&archive).unwrap()[0].meta.name, "café.txt");
+
+        // A name that cannot become a path is refused, not passed on.
+        let mut weird = vec![1u8];
+        weird.extend_from_slice(&crc32(raw).to_le_bytes());
+        weird.extend_from_slice(b"bad\0name.txt");
+        let archive = hand_built_extras(raw, b"hi", &extra(0x7075, &weird), 0, 0x21, b"");
+        assert_ne!(list(&archive).unwrap()[0].meta.name, "bad");
+    }
+
+    #[test]
+    fn a_prepended_stub_does_not_hide_the_entries() {
+        // Self-extractors and installers put their own bytes in front of a
+        // normal archive, so every recorded offset is short. The central
+        // directory still ends where the EOCD begins, which pins the shift.
+        let plain = hand_built_extras(b"a.txt", b"payload", b"", 0, 0x21, b"");
+        let mut stubbed = b"MZ\x90\x00stub!".repeat(11);
+        let stub_len = stubbed.len();
+        stubbed.extend_from_slice(&plain);
+        let listed = list(&stubbed).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].meta.name, "a.txt");
+        assert_eq!(read_entry(&stubbed, &listed[0]).unwrap(), b"payload");
+        assert!(listed[0].local_offset >= stub_len as u64);
+
+        // Without the signature right before the EOCD the shift is not
+        // guessed: a genuinely broken offset stays an error.
+        let mut broken = hand_built_extras(b"a.txt", b"payload", b"", 0, 0x21, b"");
+        let eocd = broken.len() - 22;
+        broken[eocd + 16..eocd + 20].copy_from_slice(&9999u32.to_le_bytes());
+        assert!(list(&broken).is_err());
+    }
+
+    #[test]
+    fn extra_field_walker_refuses_truncated_records() {
+        // A record whose length runs past the field must not be read as if it
+        // were whole, and must not panic.
+        let truncated = [0x55u8, 0x54, 0xff, 0x00, 1, 2, 3];
+        assert!(extra_record(&truncated, 0x5455).is_none());
+        assert!(extra_record(&[], 0x5455).is_none());
+        // A record with no payload is well-formed but useless.
+        assert_eq!(extra_record(&extra(0x5455, &[]), 0x5455), Some(&[][..]));
+        // FILETIME conversions outside the sane range are refused.
+        assert_eq!(filetime_to_unix(0), None);
+        assert_eq!(filetime_to_unix(u64::MAX), None);
+        assert_eq!(filetime_to_unix(116_444_736_000_000_000), Some(0));
     }
 
     #[test]

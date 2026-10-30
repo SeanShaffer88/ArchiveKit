@@ -37,6 +37,27 @@ mis-parsed as corrupt or partially listed. ZIP64 *extra fields* whose central
 directory still carries classic sizes (what streaming writers emit) remain
 readable, because sizes are taken from the central directory.
 
+**ZIP extra fields are read for two things, and only two.** Timestamps
+(`0x5455` Unix seconds, `0x000A` NTFS FILETIME) and the Unicode path name
+(`0x7075`). The DOS time field has 2-second resolution and cannot express dates
+outside 1980-2107, so ignoring the extras meant reporting the wrong second for
+every Info-ZIP file and 1980 for anything older; `0x7075` matters because some
+writers (Java's zipfs, some 7-Zip settings) put the real name there and a
+legacy code page in the name field, which decoded as mojibake. The `0x7075`
+name is accepted only when its CRC matches the raw name, is refused when empty
+or containing NUL, and remains untrusted input: `safe_join` still decides the
+path. Every other extra tag is skipped, as before - extras are a hint box, not
+a contract, and a truncated record inside one ends the walk rather than
+becoming an error on an otherwise readable entry.
+
+**Archives with a prepended stub are read, not refused.** Self-extractors and
+installers put their own bytes in front of a normal ZIP, which leaves every
+recorded offset short by the stub's size; those archives used to fail with
+"bad central directory signature". The central directory always ends exactly
+where the EOCD begins, which pins its real position. The shift is accepted only
+when the signature really is there and the same shift applies to every local
+header, so a genuinely broken offset still fails.
+
 **Create paths now enforce the read budgets.** Entry count, per-file size and
 total size are checked while walking the folder, and the ZIP writer refuses
 more than 65,535 entries or a 4 GiB layout instead of writing a wrapped 16-bit

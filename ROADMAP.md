@@ -43,6 +43,14 @@ extraction.
   quadratic in entry count), removes partial files when a write fails, and
   finds a directory by name with or without its trailing `/`.
 - TAR writer no longer panics on out-of-range timestamps; it reports them.
+- ZIP extra fields are read for exact times (`0x5455` Unix seconds, `0x000A`
+  NTFS FILETIME) and for the UTF-8 name in `0x7075`. Found by zipping a file
+  with an odd-second mtime: the listing reported ...:02, and a 1975 file
+  reported 1980. Other extra tags are still skipped.
+- Archives with a self-extractor stub in front (prepended bytes, short recorded
+  offsets) are located from the EOCD instead of failing on the first record.
+- Per-entry budget errors name the entry and its size instead of saying only
+  that the archive exceeded a budget.
 
 **v0.3**
 - ZIP64 *read* support for large archives, and `data-descriptor` archives

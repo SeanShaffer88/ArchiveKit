@@ -43,6 +43,11 @@ ak_zip_append("backup.zip", "extra.log", "logs/extra.log");
   re-applied on extract. Both use the same ordering rule, directories last,
   so writing children cannot undo a parent's time and a read-only directory
   can still be populated before it is locked.
+- **Exact file times, not rounded ones.** ZIP's DOS field stores 2-second
+  steps and nothing before 1980, so archives that record a real timestamp in an
+  extra field (`0x5455` or NTFS `0x000A`) are read from there; the same goes for
+  the UTF-8 name in `0x7075`, which some writers use to spell names the legacy
+  code page cannot. Archives with a self-extractor stub in front are read too.
 - **Tarballs with symlinks extract instead of failing.** Link and special-file
   entries are listed with their `type`, and extraction skips them and says so
   through `ak_last_warning()` — Windows cannot recreate them anyway, and one
@@ -74,7 +79,7 @@ ak_zip_append("backup.zip", "extra.log", "logs/extra.log");
 
 ## Verification status
 
-- 46 tests: 41 unit tests plus 5 integration tests. CRC vectors;
+- 51 tests: 46 unit tests plus 5 integration tests. CRC vectors;
   zlib-produced DEFLATE streams (embedded, byte-exact); deflate↔inflate
   roundtrips including incompressible data, window-edge data, block
   boundaries and multi-block streams; Huffman length limiting and
@@ -82,7 +87,8 @@ ak_zip_append("backup.zip", "extra.log", "logs/extra.log");
   truncation; ZIP64 marker refusal; TAR prefix splitting, GNU `L` and pax
   record handling; legacy CP437 versus flagged-UTF-8 names; DOS-versus-Unix
   read-only decoding; data-descriptor archives; traversal and device-name
-  refusals; timestamps and the read-only attribute restored on extraction;
+  refusals; exact times from extra fields, timestamps and the read-only
+  attribute restored on extraction; prepended-stub archives;
   FFI create→list→test→extract cycles including single-entry and
   folder-prefix extraction.
 - The codec is verified three ways: zlib-produced vectors embedded in

@@ -269,7 +269,15 @@ pub fn read_entry(bytes: &[u8], entry: &TarEntry) -> AResult<Vec<u8>> {
         }
     }
     if entry.meta.size > crate::MAX_ENTRY_BYTES as u64 {
-        return err(ERR_CORRUPT, "TAR entry exceeds output limit");
+        return err(
+            ERR_CORRUPT,
+            format!(
+                "entry '{}' is {} bytes, over the {} MiB per-entry limit",
+                entry.meta.name,
+                entry.meta.size,
+                crate::MAX_ENTRY_BYTES / (1024 * 1024)
+            ),
+        );
     }
     let end = entry
         .data_offset

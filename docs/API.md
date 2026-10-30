@@ -22,6 +22,20 @@ back to the extension. Listing JSON per entry:
 DOS read-only attribute (ZIP) or a mode with no write bit (TAR); `type` is
 `file`, `dir`, `symlink`, `hardlink` or `other`.
 
+## Timestamps
+
+`modified_unix` is the modification time the archive states, in Unix seconds.
+For ZIP that means the exact value when the archive carries an extended
+timestamp (`0x5455` or NTFS `0x000A`), falling back to the DOS field, whose
+resolution is 2 seconds and whose range is 1980-2107; a zero DOS time is
+reported as the DOS epoch because that is what the archive says. For TAR it is
+the header's `mtime`, with pax overrides honoured, and `null` when the archive
+records none.
+
+Extraction restores those times best-effort. A TAR entry with no recorded time
+is left alone; a failed attribute write never fails the extraction, since the
+content is already on disk.
+
 ## What gets extracted
 
 Regular files and directories are written. TAR entries of any other kind —

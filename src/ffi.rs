@@ -96,8 +96,28 @@ fn read_archive(path: &str) -> AResult<(Vec<u8>, Format, Listed)> {
         total = total
             .checked_add(meta.size)
             .ok_or((ERR_CORRUPT, "archive size overflow".into()))?;
-        if meta.size > crate::MAX_ENTRY_BYTES as u64 || total > crate::MAX_TOTAL_BYTES {
-            return crate::err(ERR_CORRUPT, "archive exceeds output budget");
+        if meta.size > crate::MAX_ENTRY_BYTES as u64 {
+            // Naming the entry is the difference between "your archive is
+            // rejected" and "this one file is too big".
+            return crate::err(
+                ERR_CORRUPT,
+                format!(
+                    "entry '{}' is {} bytes, over the {} MiB per-entry limit",
+                    meta.name,
+                    meta.size,
+                    crate::MAX_ENTRY_BYTES / (1024 * 1024)
+                ),
+            );
+        }
+        if total > crate::MAX_TOTAL_BYTES {
+            return crate::err(
+                ERR_CORRUPT,
+                format!(
+                    "entries add up to {} bytes, over the {} MiB total limit",
+                    total,
+                    crate::MAX_TOTAL_BYTES / (1024 * 1024)
+                ),
+            );
         }
     }
     Ok((bytes, fmt, listed))
@@ -1621,6 +1641,37 @@ mod tests {
         assert!(message.contains("symbolic link"), "{message}");
         // The whole archive still verifies, links included.
         assert_eq!(ak_test(archive_c.as_ptr()), 3);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn oversize_entries_are_named_in_the_error() {
+        // A central-directory size larger than the per-entry budget is refused
+        // before any data is read. The message has to say which entry and how
+        // big, or the caller learns nothing about their own archive.
+        let base = std::env::temp_dir().join(format!("ak-budget-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let mut bytes = zip::create(&[NewEntry::file("huge.bin", b"x".to_vec(), 0)]).unwrap();
+        let declared = (crate::MAX_ENTRY_BYTES + 1) as u32;
+        // Local header sizes, then the same fields in the central record.
+        bytes[18..22].copy_from_slice(&declared.to_le_bytes());
+        bytes[22..26].copy_from_slice(&declared.to_le_bytes());
+        let eocd = bytes.len() - 22;
+        let cd = u32::from_le_bytes(bytes[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        bytes[cd + 24..cd + 28].copy_from_slice(&declared.to_le_bytes());
+        let path = base.join("huge.zip");
+        fs::write(&path, &bytes).unwrap();
+        let path_c = cstr(path.to_str().unwrap());
+        assert_eq!(ak_test(path_c.as_ptr()), -1);
+        assert_eq!(ak_last_error_code(), crate::ERR_CORRUPT as c_int);
+        // SAFETY: thread-local C string owned by this module.
+        let message = unsafe { CStr::from_ptr(ak_last_error()) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(message.contains("huge.bin"), "{message}");
+        assert!(message.contains("64 MiB"), "{message}");
         let _ = fs::remove_dir_all(&base);
     }
 
